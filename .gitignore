@@ -1,0 +1,22 @@
+# Build output
+build/
+dist/
+release/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Never commit collected data or a browser login
+*.db
+*.db-wal
+*.db-shm
+*.log
+chrome_profile/
+images/
+queue.json
+batches.json
+gui_settings.json

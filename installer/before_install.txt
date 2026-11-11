@@ -1,0 +1,11 @@
+DiscordAnt reads Discord the way a person does: it opens a browser, you log in, and it scrolls and saves what it sees.
+
+Please know this before you install:
+
+- Discord's terms do not allow automating a personal account. DiscordAnt goes slowly on purpose, but nobody can promise that an account will not be limited or closed for using it. You use it at your own risk.
+
+- It only collects what your own account can already see. Treat other people's messages with care, and follow the rules of the servers you are in.
+
+- What it collects stays on this PC. DiscordAnt has no account, no server and no tracking.
+
+- DiscordAnt is an independent project. It is not affiliated with or endorsed by Discord.
