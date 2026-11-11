@@ -13,8 +13,8 @@ On top of that:
     scraped before is not scraped again.
   - Pause / resume (the browser stays open while paused).
   - Channel and server names are read off the page.
-  - Images Discord loads while scrolling are saved, then fetched at full size
-    in a second tab (a plain image load, the same as opening the picture).
+  - Supported raster images are saved through an isolated, bounded HTTPS
+    downloader. It carries no Discord login and never renders web content.
   - Mentions, reactions, stickers, forwarded messages and polls are kept.
 
 The output file for a job is always the complete requested range, written
@@ -22,27 +22,40 @@ from the archive.
 """
 
 import asyncio
+import http.client
 import json
-import os
+import math
 import random
 import re
+import ssl
+import threading
 import time
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from playwright.async_api import async_playwright
 
 try:
-    from . import store as store_mod
+    from . import exports, store as store_mod
 except ImportError:  # running as a plain script / frozen exe
+    import exports
     import store as store_mod
 
-MSG_URL_RE = re.compile(r"discord\.com/api/v\d+/channels/(\d+)/messages(?:\?|$)")
-SEARCH_URL_RE = re.compile(r"discord\.com/api/v\d+/guilds/(\d+)/messages/search")
-LINK_RE = re.compile(r"discord\.com/channels/(\d+)/(\d+)")
+MSG_PATH_RE = re.compile(r"/api/v\d+/channels/(\d+)/messages")
+SEARCH_PATH_RE = re.compile(r"/api/v\d+/guilds/(\d+)/messages/search")
+LINK_PATH_RE = re.compile(r"/channels/(\d+)/(\d+)(?:/\d+)?/?")
 ATTACH_PATH_RE = re.compile(r"^/(?:ephemeral-)?attachments/(\d+)/(\d+)/")
 DISCORD_EPOCH_MS = 1420070400000
+IMAGE_HOSTS = frozenset({"cdn.discordapp.com", "cdn.discordapp.net",
+                         "media.discordapp.net", "images-ext-1.discordapp.net",
+                         "images-ext-2.discordapp.net"})
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_SESSION_IMAGE_BYTES = 100 * 1024 * 1024
+IMAGE_DOWNLOAD_TIMEOUT_S = 20
+IMAGE_CHUNK_BYTES = 64 * 1024
+CLEANUP_TIMEOUT_S = 5
 
 # Pacing — deliberately human-slow. Do not "optimize" these down.
 SCROLL_MIN_S, SCROLL_MAX_S = 2.5, 5.5
@@ -113,10 +126,48 @@ IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
 
 
 # ------------------------------------------------------------------ helpers
+def _https_url(url, hosts):
+    """Parse only an exact HTTPS origin, without credentials or odd ports."""
+    if not isinstance(url, str) or not url or any(c.isspace() or ord(c) < 32
+                                               for c in url) or "\\" in url:
+        return None
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or parsed.hostname not in hosts
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port not in (None, 443) or parsed.fragment):
+            return None
+        return parsed
+    except ValueError:
+        return None
+
+
+def _discord_url(url):
+    return _https_url(url, {"discord.com"})
+
+
+def _image_url(url):
+    parsed = _https_url(url, IMAGE_HOSTS)
+    if parsed and (ATTACH_PATH_RE.match(parsed.path)
+                   or parsed.path.startswith("/external/")):
+        return parsed
+    return None
+
+
+def _valid_id(value):
+    text = str(value) if value is not None else ""
+    return (len(text) <= 19 and text.isascii() and text.isdecimal()
+            and 0 < int(text) <= 2**63 - 1)
+
+
 def parse_channel_link(link):
     """Return (guild_id, channel_id) from a discord.com/channels/... URL."""
-    m = LINK_RE.search(link.strip())
-    if not m:
+    link = link.strip()
+    if link.startswith("discord.com/"):
+        link = "https://" + link
+    parsed = _discord_url(link)
+    m = LINK_PATH_RE.fullmatch(parsed.path) if parsed else None
+    if not m or not all(_valid_id(v) for v in m.groups()):
         raise ValueError("That doesn't look like a Discord channel link "
                          "(expected .../channels/<server>/<channel>).")
     return m.group(1), m.group(2)
@@ -440,9 +491,7 @@ def export_channel(store, channel_id, lo, hi, out_path, log):
     rows = [export_row(rec, channel_id, store, by_msg.get(rec["id"], []))
             for rec in store.messages_in(channel_id, lo, hi)]
     out_path = Path(out_path)
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, out_path)
+    exports.write_text(out_path, json.dumps(rows, ensure_ascii=False, indent=1))
     if rows:
         log(f"Saved {len(rows)} messages ({rows[0]['ts']} -> {rows[-1]['ts']})")
     else:
@@ -452,6 +501,14 @@ def export_channel(store, channel_id, lo, hi, out_path, log):
 
 
 # ------------------------------------------------------------------ pacing
+class PacerInterrupted(Exception):
+    """A browser/download operation ended because its job stopped or expired."""
+
+    def __init__(self, outcome):
+        super().__init__(outcome)
+        self.outcome = outcome
+
+
 class Pacer:
     """Human-paced waits that honour Stop, Pause and the per-job time limit."""
 
@@ -459,7 +516,10 @@ class Pacer:
         self.stop_event = stop_event
         self.pause_event = pause_event
         self.log = log
-        self.deadline = time.monotonic() + max_minutes * 60 if max_minutes else None
+        if max_minutes is not None and (not math.isfinite(max_minutes) or max_minutes < 0):
+            raise ValueError("Time limit must be a finite, nonnegative number.")
+        self.deadline = (time.monotonic() + max_minutes * 60
+                         if max_minutes is not None else None)
         self.steps_until_break = random.randint(BREAK_EVERY_MIN, BREAK_EVERY_MAX)
 
     @property
@@ -472,6 +532,60 @@ class Pacer:
 
     def out_of_time(self):
         return self.deadline is not None and time.monotonic() >= self.deadline
+
+    def remaining(self):
+        return (max(0.0, self.deadline - time.monotonic())
+                if self.deadline is not None else None)
+
+    def outcome(self):
+        return STOPPED if self.stopped else BUDGET if self.out_of_time() else None
+
+    async def checkpoint(self):
+        """Cooperate with pause, Stop and the active-time budget."""
+        if self.outcome() is not None:
+            return False
+        await self.hold_if_paused()
+        return self.outcome() is None
+
+    async def run(self, awaitable, timeout=None):
+        """Bound an operation by its timeout, Stop and this job's budget."""
+        if not await self.checkpoint():
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            elif hasattr(awaitable, "cancel"):
+                awaitable.cancel()
+            raise PacerInterrupted(self.outcome())
+        task = asyncio.ensure_future(awaitable)
+        operation_end = time.monotonic() + timeout if timeout is not None else None
+        try:
+            while True:
+                before_pause = time.monotonic()
+                if not await self.checkpoint():
+                    raise PacerInterrupted(self.outcome())
+                if operation_end is not None:
+                    # Explicit job pauses suspend the operation's wait budget too.
+                    operation_end += max(0.0, time.monotonic() - before_pause)
+                if task.done():
+                    return await task
+                if operation_end is not None and time.monotonic() >= operation_end:
+                    raise asyncio.TimeoutError()
+                wait = 0.1
+                if operation_end is not None:
+                    wait = min(wait, max(0.0, operation_end - time.monotonic()))
+                remaining = self.remaining()
+                if remaining is not None:
+                    wait = min(wait, remaining)
+                await asyncio.wait({task}, timeout=wait)
+        finally:
+            if not task.done():
+                task.cancel()
+                # Playwright awaits cooperate with cancellation. A broken/mock
+                # operation must not keep the queue hung while it is stopping.
+                await asyncio.wait({task}, timeout=0.5)
+            if task.done() and not task.cancelled():
+                task.exception()  # consume failures when cancellation won the race
+            elif not task.done():
+                task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     async def hold_if_paused(self):
         if not self.paused:
@@ -488,19 +602,20 @@ class Pacer:
         return waited
 
     async def nap(self, lo, hi=None):
-        """Sleep lo..hi seconds. Returns False if Stop was pressed meanwhile."""
+        """Sleep lo..hi seconds. False means Stop or the job budget expired."""
         secs = random.uniform(lo, hi) if hi is not None else lo
         end = time.monotonic() + secs
         while True:
-            if self.stopped:
+            if self.outcome() is not None:
                 return False
             if self.paused:
-                await self.hold_if_paused()
+                end += await self.hold_if_paused()
                 continue
             left = end - time.monotonic()
             if left <= 0:
                 return True
-            await asyncio.sleep(min(1.0, left))
+            remaining = self.remaining()
+            await asyncio.sleep(min(0.25, left, remaining if remaining is not None else left))
 
     async def step(self, status=None, lo=SCROLL_MIN_S, hi=SCROLL_MAX_S):
         """The wait after one action, with a longer break every so often."""
@@ -527,16 +642,88 @@ def _url_expired(url):
 def _full_size_url(row):
     """The link to load for a full-size copy (big or animated ones scaled)."""
     url = row["url"]
-    w, h = row.get("w") or 0, row.get("h") or 0
+    w, h = (v if isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 100000
+            else 0 for v in (row.get("w"), row.get("h")))
     name = (row.get("name") or "").lower()
     big = max(w, h) > 1600
-    if not (big or name.endswith(".gif")) or "discordapp.net" not in url:
+    parsed = _image_url(url)
+    if not parsed:
+        return None
+    if not (big or name.endswith(".gif")) or parsed.hostname == "cdn.discordapp.com":
         return url
     extra = "format=webp"
     if w and h:
         scale = min(1.0, 1568 / max(w, h))
         extra += f"&width={max(1, round(w * scale))}&height={max(1, round(h * scale))}"
     return url + ("&" if "?" in url else "?") + extra
+
+
+# A stuck OS DNS resolver must not strand the GUI/asyncio executor at exit.
+# Dedicated daemon workers are capped across sessions, including abandoned ones.
+_IMAGE_WORKERS = threading.BoundedSemaphore(2)
+
+
+def _read_cdn_image(url, limit, deadline, cancelled):
+    """Stream one inert HTTPS resource, with no profile, cookies or redirects.
+
+    This is an independent transport, not a page: there is no JavaScript,
+    navigation, subresource loading, inherited proxy or Discord login state.
+    """
+    parsed = _image_url(url)
+    if parsed is None:
+        raise ValueError("Image URL is not an allowed Discord HTTPS CDN resource.")
+
+    def remaining():
+        left = deadline - time.monotonic()
+        if cancelled.is_set() or left <= 0:
+            raise TimeoutError("Image download stopped or timed out.")
+        return left
+
+    connection = http.client.HTTPSConnection(parsed.hostname, 443,
+                                             timeout=min(2.0, remaining()),
+                                             context=ssl.create_default_context())
+    try:
+        target = parsed.path + ("?" + parsed.query if parsed.query else "")
+        connection.request("GET", target, headers={"Accept": "image/*",
+                           "Accept-Encoding": "identity", "Connection": "close"})
+        remaining()
+        response = connection.getresponse()
+        remaining()
+        # Never follow even a same-host redirect: it could change resource type
+        # or lead to a different host after another hop.
+        if response.status != 200:
+            raise ValueError(f"Image CDN returned HTTP {response.status}.")
+        ctype = response.getheader("content-type", "").split(";")[0].strip().lower()
+        if ctype not in IMAGE_EXT:
+            raise ValueError("Image CDN did not return a supported raster image.")
+        if response.getheader("content-encoding", "identity").lower() != "identity":
+            raise ValueError("Encoded image responses are not accepted.")
+        length = response.getheader("content-length")
+        if length is not None and (not length.isdecimal() or int(length) > limit):
+            raise ValueError("Image exceeds the download size limit.")
+        chunks, size = [], 0
+        while True:
+            left = remaining()
+            sock = connection.sock
+            if sock is None:
+                sock = getattr(getattr(response.fp, "raw", None), "_sock", None)
+            if sock is not None:
+                sock.settimeout(min(2.0, left))
+            chunk = response.read1(min(IMAGE_CHUNK_BYTES, limit - size + 1))
+            remaining()
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                raise ValueError("Image exceeds the download size limit.")
+            chunks.append(chunk)
+        if length is not None and size != int(length):
+            raise ValueError("Image response was truncated.")
+        if not size:
+            raise ValueError("Image response was empty.")
+        return b"".join(chunks), ctype
+    finally:
+        connection.close()
 
 
 class Session:
@@ -553,14 +740,22 @@ class Session:
         self.searches = []      # one dict per captured search response
         self.images_saved = 0
         self._handler_errors = 0
+        self._response_tasks = set()
+        self._request_starts = weakref.WeakKeyDictionary()
+        self._image_slots = asyncio.Semaphore(2)
+        self._download_lock = asyncio.Lock()
+        self._image_bytes = 0
+        self._image_failures = 0
+        self._image_limit_reported = False
+        self._closed = False
         self._pw = None
         self.context = None
         self.page = None
 
     async def __aenter__(self):
-        self._pw = await async_playwright().start()
+        self._pw = await self.pacer.run(async_playwright().start(), timeout=30)
         try:
-            self.context = await self._pw.chromium.launch_persistent_context(
+            self.context = await self.pacer.run(self._pw.chromium.launch_persistent_context(
                 user_data_dir=str(self.profile_dir),
                 headless=False,
                 args=["--disable-background-timer-throttling",
@@ -568,67 +763,126 @@ class Session:
                       "--disable-renderer-backgrounding",
                       "--start-maximized"],
                 no_viewport=True,
-            )
-        except Exception:
-            await self._pw.stop()
+                chromium_sandbox=True,
+                timeout=30000,
+            ), timeout=30)
+            self.page = (self.context.pages[0] if self.context.pages else
+                         await self.pacer.run(self.context.new_page(), timeout=10))
+        except BaseException:
+            if self.context is not None:
+                await self._bounded_cleanup(self.context.close())
+            await self._bounded_cleanup(self._pw.stop())
             raise
-        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-        self.page.on("response", self._on_response)
+        self.page.on("request", self._note_request)
+        self.page.on("response", self._queue_response)
         return self
 
-    async def __aexit__(self, *exc):
+    async def _bounded_cleanup(self, awaitable):
+        """Clean up even after budget expiry without hanging or masking it."""
+        task = asyncio.ensure_future(awaitable)
         try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=CLEANUP_TIMEOUT_S)
+        except Exception as exc:
+            task.cancel()
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            self.log(f"NOTE: browser cleanup did not finish normally ({type(exc).__name__}).")
+
+    async def __aexit__(self, *exc):
+        self._closed = True
+        try:
+            tasks = list(self._response_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.wait(tasks, timeout=1)
             if self.context is not None:
-                await self.context.close()
+                await self._bounded_cleanup(self.context.close())
         finally:
-            await self._pw.stop()
+            if self._pw is not None:
+                await self._bounded_cleanup(self._pw.stop())
         return False
 
     async def open_app(self):
         """Load Discord and wait for a login if needed. False = Stop pressed."""
-        await self.page.goto("https://discord.com/app")
-        await asyncio.sleep(5)
-        while "login" in self.page.url:
-            self.log("Waiting for Discord login (log in in the browser window)...")
+        try:
+            await self.pacer.run(self.page.goto("https://discord.com/app"), timeout=30)
             if not await self.pacer.nap(5):
                 return False
-        return not self.pacer.stopped
+            while True:
+                parsed = _discord_url(self.page.url)
+                if parsed is None:
+                    raise ValueError("The browser left Discord's HTTPS website.")
+                if not parsed.path.startswith("/login"):
+                    return await self.pacer.checkpoint()
+                self.log("Waiting for Discord login (log in in the browser window)...")
+                if not await self.pacer.nap(5):
+                    return False
+        except PacerInterrupted:
+            return False
 
     # ---- passive capture
+    def _note_request(self, request):
+        self._request_starts[request] = time.monotonic()
+
+    def _queue_response(self, resp):
+        if self._closed:
+            return
+        task = asyncio.create_task(self._on_response(resp))
+        self._response_tasks.add(task)
+        task.add_done_callback(self._response_tasks.discard)
+
     async def _on_response(self, resp):
         url = resp.url
         try:
-            m = MSG_URL_RE.search(url)
+            request_started = self._request_starts.pop(resp.request, None)
+        except (TypeError, AttributeError):
+            request_started = None  # unknown/mock request: search fails closed
+        try:
+            parsed = _discord_url(url)
+            m = MSG_PATH_RE.fullmatch(parsed.path) if parsed else None
             if m:
                 if resp.status == 200 and resp.request.method == "GET":
-                    data = await resp.json()
+                    data = await self.pacer.run(resp.json(), timeout=30)
                     if isinstance(data, list):
-                        self._take_batch(m.group(1), url, data)
+                        self._take_batch(m.group(1), url, data, request_started=request_started)
                 return
-            m = SEARCH_URL_RE.search(url)
+            m = SEARCH_PATH_RE.fullmatch(parsed.path) if parsed else None
             if m:
+                if resp.request.method != "GET":
+                    return
                 try:
-                    data = await resp.json()
+                    data = await self.pacer.run(resp.json(), timeout=30)
+                except PacerInterrupted:
+                    return
                 except Exception:
                     data = None
-                self._take_search(m.group(1), url, resp.status, data)
+                self._take_search(m.group(1), url, resp.status, data,
+                                  request_started=request_started)
                 return
             if self.images_dir is not None and resp.status == 200:
-                host = urlparse(url).hostname or ""
-                if host.endswith(("discordapp.net", "discordapp.com")):
+                if _image_url(url):
                     await self._take_image(resp)
+        except PacerInterrupted:
+            return
         except Exception as e:   # a capture hiccup must never kill the scrape
             self._handler_errors += 1
             if self._handler_errors <= 3:
                 self.log(f"NOTE: could not read one response ({type(e).__name__}: {e})")
 
-    def _take_batch(self, channel_id, url, data):
+    def _take_batch(self, channel_id, url, data, request_started=None):
         q = parse_qs(urlparse(url).query)
         try:
             limit = int(q.get("limit", ["50"])[0])
-        except ValueError:
-            limit = 50
-        msgs = [m for m in data if isinstance(m, dict) and m.get("id")]
+        except ValueError as exc:
+            raise ValueError("Invalid Discord message-page limit.") from exc
+        if (not _valid_id(channel_id) or not 1 <= limit <= 100
+                or sum(k in q for k in ("before", "after", "around")) > 1
+                or any(len(v) != 1 for v in q.values())
+                or any(not _valid_id(q[k][0]) for k in ("before", "after", "around") if k in q)):
+            raise ValueError("Invalid Discord message-page bounds.")
+        msgs = [m for m in data if isinstance(m, dict) and _valid_id(m.get("id"))]
+        if len(msgs) != len(data):
+            raise ValueError("Malformed Discord message-page records.")
         recs = [normalize(m) for m in msgs]
         ids = sorted(int(r["id"]) for r in recs)
         new_ids = self.store.put_messages(channel_id, recs)
@@ -665,14 +919,24 @@ class Session:
                 lo, hi = (0 if top else ids[0]), ids[-1]
         if lo is not None and hi is not None and hi >= lo:
             self.store.add_coverage(channel_id, lo, hi)
+        target = next((int(q[k][0]) for k in ("before", "after", "around") if k in q), None)
         self.fetches.append({"channel": channel_id, "kind": kind, "n": len(ids),
                              "min": ids[0] if ids else None,
                              "max": ids[-1] if ids else None,
-                             "new": new_ids, "top": top})
+                              "new": new_ids, "top": top, "at_start": top,
+                              "at_end": bool(ids) and (kind == "latest" or
+                                  (kind == "around" and target in ids and ids[-1] == target)),
+                              "query": {k: v[0] for k, v in q.items()},
+                              "request_started": request_started,
+                              "request_target": {"kind": kind, "id": target},
+                              "ids": tuple(ids), "coverage_lo": lo, "coverage_hi": hi})
 
-    def _take_search(self, guild_id, url, status, data):
+    def _take_search(self, guild_id, url, status, data, request_started=None):
+        if not _valid_id(guild_id):
+            raise ValueError("Invalid Discord server id.")
         q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
         info = {"guild": guild_id, "query": q, "status": status, "total": None,
+                "request_started": request_started,
                 "hits": [], "retry_after": None, "ok": False, "deep": False}
         if isinstance(data, dict):
             info["retry_after"] = data.get("retry_after")
@@ -682,7 +946,8 @@ class Session:
                 info["deep"] = bool(data.get("doing_deep_historical_index"))
                 for group in data.get("messages") or []:
                     group = [m for m in (group if isinstance(group, list) else [group])
-                             if isinstance(m, dict) and m.get("id")]
+                         if isinstance(m, dict) and _valid_id(m.get("id"))
+                         and _valid_id(m.get("channel_id"))]
                     for m in group:
                         ch = str(m.get("channel_id") or "")
                         rec = normalize(m)
@@ -700,60 +965,126 @@ class Session:
 
     async def _take_image(self, resp):
         ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-        if not ctype.startswith("image/"):
+        parsed = _image_url(resp.url)
+        if ctype not in IMAGE_EXT or parsed is None or self._image_slots.locked():
             return
-        path = urlparse(resp.url).path
+        path = parsed.path
         m = ATTACH_PATH_RE.match(path)
         if m:
-            row = self.store.image("a:" + m.group(2))
+            rows = self.store.images_by_attachment(m.group(2))
         elif path.startswith("/external/"):
-            row = self.store.image_by_match(path)
+            rows = self.store.images_by_match(path)
         else:
             return
-        if not row or row["full"]:
+        rows = [row for row in rows if store_mod.image_identity(row.get("url")) ==
+                store_mod.image_identity(resp.url) and (not row["full"]
+                or not row.get("file") or not Path(row["file"]).is_file())]
+        if not rows:
             return
+        async with self._image_slots:
+            image = await self._download_image(resp.url)
+            if image is not None:
+                body, ctype = image
+                for row in rows:
+                    self._save_image(row, body, ctype, full=False)
+
+    async def _download_image(self, url):
+        """Download in a bounded, isolated transport; never render untrusted data."""
+        if _image_url(url) is None or self._closed or not await self.pacer.checkpoint():
+            return None
         try:
-            body = await resp.body()
-        except Exception:
-            return                      # e.g. served from the browser's cache
-        if len(body) <= (row["bytes"] or 0):
-            return                      # already hold a copy at least this good
-        self._save_image(row, body, ctype, full=False)
+            await self.pacer.run(self._download_lock.acquire())
+        except PacerInterrupted:
+            return None
+        cancelled = threading.Event()
+        try:
+            limit = min(MAX_IMAGE_BYTES, MAX_SESSION_IMAGE_BYTES - self._image_bytes)
+            if limit <= 0:
+                if not self._image_limit_reported:
+                    self.log("NOTE: the 100 MiB image limit for this job was reached; remaining pictures were skipped.")
+                    self._image_limit_reported = True
+                return None
+            if not _IMAGE_WORKERS.acquire(blocking=False):
+                self._image_failures += 1
+                if self._image_failures <= 3:
+                    self.log("NOTE: image download workers are busy; this picture was skipped.")
+                return None
+            done = threading.Event()
+            result = []
+            timeout = IMAGE_DOWNLOAD_TIMEOUT_S
+            remaining = self.pacer.remaining()
+            if remaining is not None:
+                timeout = min(timeout, remaining)
+            deadline = time.monotonic() + timeout
+
+            def worker():
+                try:
+                    result.append(_read_cdn_image(url, limit, deadline, cancelled))
+                except Exception as exc:
+                    result.append(exc)
+                finally:
+                    _IMAGE_WORKERS.release()
+                    done.set()
+
+            try:
+                threading.Thread(target=worker, name="DiscordAnt image download",
+                                 daemon=True).start()
+            except Exception:
+                _IMAGE_WORKERS.release()
+                raise
+            while not done.is_set():
+                if (self._closed or time.monotonic() >= deadline
+                        or not await self.pacer.nap(0.05)):
+                    return None
+            if isinstance(result[0], Exception):
+                self._image_failures += 1
+                if self._image_failures <= 3:
+                    self.log(f"NOTE: skipped an image ({result[0]})")
+                return None
+            body, ctype = result[0]
+            if self._closed or self.pacer.outcome() is not None:
+                return None
+            self._image_bytes += len(body)
+            return body, ctype
+        finally:
+            cancelled.set()
+            self._download_lock.release()
 
     def _save_image(self, row, body, ctype, full):
+        if (self._closed or ctype not in IMAGE_EXT or len(body) > MAX_IMAGE_BYTES
+                or not _valid_id(row.get("channel_id")) or not _valid_id(row.get("message_id"))):
+            return False
         folder = self.images_dir / str(row["channel_id"])
+        if not folder.resolve().is_relative_to(self.images_dir.resolve()):
+            return False
         folder.mkdir(parents=True, exist_ok=True)
-        ext = IMAGE_EXT.get(ctype, ".img")
-        path = folder / f"{row['message_id']}_{safe_name(row['key'])}{ext}"
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_bytes(body)
-        os.replace(tmp, path)
-        old = row.get("file")
-        if old and Path(old) != path:
-            try:
-                Path(old).unlink()
-            except OSError:
-                pass
-        self.store.set_image_file(row["key"], path, len(body), full)
-        self.images_saved += 1
+        ext = IMAGE_EXT[ctype]
+        path = folder / (f"{row['message_id']}_{safe_name(row['key'])}"
+                         f"_g{int(row['generation'])}{ext}")
+        saved = self.store.save_image_file(row, path, body, full)
+        if saved:
+            self.images_saved += 1
+        return saved
 
     # ---- names
     async def note_names(self, guild_id=None):
         """Read the channel and server names off the page into the archive."""
         try:
-            m = LINK_RE.search(self.page.url)
+            parsed = _discord_url(self.page.url)
+            m = LINK_PATH_RE.fullmatch(parsed.path) if parsed else None
             if not m:
                 return
             gid, cid = m.group(1), m.group(2)
-            title = await self.page.title()
+            title = await self.pacer.run(self.page.title(), timeout=10)
             parts = [p.strip() for p in title.split(" | ")]
             if len(parts) >= 3 and parts[-2].startswith("#"):
                 self.store.set_name(gid, "guild", parts[-1])
                 self.store.set_name(cid, "channel", parts[-2][1:], gid)
-            label = await self.page.evaluate(JS_LIST_LABEL)
+            label = await self.pacer.run(self.page.evaluate(JS_LIST_LABEL), timeout=10)
             if label and label.lower().startswith("messages in "):
                 self.store.set_name(cid, "channel", label[12:], gid)
-            for chan_id, name in await self.page.evaluate(JS_SIDEBAR, guild_id or gid):
+            sidebar = await self.pacer.run(self.page.evaluate(JS_SIDEBAR, guild_id or gid), timeout=10)
+            for chan_id, name in sidebar:
                 if chan_id.isdigit() and name:
                     self.store.set_name(chan_id, "channel", name, guild_id or gid)
         except Exception:
@@ -761,40 +1092,33 @@ class Session:
 
     # ---- full-size images
     async def fetch_full_images(self, rows):
-        """Load each image at full size in a second tab (thumbnails that were
-        saved while scrolling stay as the fallback). Returns how many it got."""
-        rows = [r for r in rows if not r["full"] and r.get("url")
-                and not _url_expired(r["url"])]
+        """Fetch raster bytes without a browser profile or rendered page."""
+        rows = [r for r in rows if (not r["full"] or not r.get("file")
+                                   or not Path(r["file"]).is_file())
+                and _image_url(r.get("url")) and not _url_expired(r["url"])]
         if not rows or self.images_dir is None:
             return 0
         self.log(f"Fetching {len(rows)} image(s) at full size...")
         got = 0
-        tab = await self.context.new_page()
-        try:
-            for i, row in enumerate(rows, 1):
-                if self.pacer.stopped or self.pacer.out_of_time():
-                    self.log(f"Stopped the image pass early ({got} of {len(rows)} done; "
-                             f"the rest keep their thumbnails).")
-                    break
-                try:
-                    resp = await tab.goto(_full_size_url(row), wait_until="load",
-                                          timeout=30000)
-                    ctype = ((resp.headers.get("content-type") if resp else "") or "")
-                    ctype = ctype.split(";")[0].strip().lower()
-                    if resp is not None and resp.status == 200 and ctype.startswith("image/"):
-                        self._save_image(row, await resp.body(), ctype, full=True)
-                        got += 1
-                except Exception:
-                    pass                # keep whatever thumbnail we already have
-                if i % 25 == 0:
-                    self.log(f"  images: {i} of {len(rows)}")
-                await self.pacer.step(lo=IMAGE_MIN_S, hi=IMAGE_MAX_S)
-        finally:
-            try:
-                await tab.close()
-                await self.page.bring_to_front()
-            except Exception:
-                pass
+        by_url = {}
+        for row in rows:
+            by_url.setdefault(_full_size_url(row), []).append(row)
+        for i, (url, refs) in enumerate(by_url.items(), 1):
+            if not await self.pacer.checkpoint():
+                self.log(f"Stopped the image pass early ({got} of {len(rows)} done; "
+                         f"the rest keep their thumbnails).")
+                break
+            image = await self._download_image(url)
+            if self._image_limit_reported:
+                break
+            if image is not None:
+                body, ctype = image
+                for row in refs:
+                    got += bool(self._save_image(row, body, ctype, full=True))
+            if i % 25 == 0:
+                self.log(f"  images: {i} resources of {len(by_url)}")
+            if not await self.pacer.step(lo=IMAGE_MIN_S, hi=IMAGE_MAX_S):
+                break
         return got
 
 
@@ -841,123 +1165,144 @@ async def run_scrape(*, guild_id, channel_id, start_dt, end_dt, out_path,
     outcome = None
     done_reason = None
 
-    async with Session(profile_dir=profile_dir, store=store, log=log, pacer=pacer,
-                       images_dir=images_dir) as ses:
-        page = ses.page
-        if not await ses.open_app():
-            return result(STOPPED)
+    images = 0
+    try:
+        async with Session(profile_dir=profile_dir, store=store, log=log, pacer=pacer,
+                           images_dir=images_dir) as ses:
+            page = ses.page
+            if not await ses.open_app():
+                return result(pacer.outcome() or STOPPED)
 
-        floor = None            # lowest message id fetched since the last jump
-        attempts = {}           # gap top -> how many times we jumped there
-        need_jump = True
-        named = False
-        idle_steps = 0
-        error_retries = 0
+            floor = None            # lowest message id fetched since the last jump
+            attempts = {}           # gap top -> how many times we jumped there
+            need_jump = True
+            named = False
+            idle_steps = 0
+            error_retries = 0
 
-        def progress():
-            back = snowflake_to_dt(floor).strftime("%m-%d %H:%M UTC") if floor else "?"
-            return f"{new_total} new messages so far, back to {back}"
+            def progress():
+                back = snowflake_to_dt(floor).strftime("%m-%d %H:%M UTC") if floor else "?"
+                return f"{new_total} new messages so far, back to {back}"
 
-        while True:
-            got_any = False
-            fetches, ses.fetches[:] = ses.fetches[:], []
-            for f in fetches:
-                if f["channel"] != channel_id:
-                    continue        # Discord preloads other channels too
-                got_any = True
-                if f["min"] is not None:
-                    floor = f["min"] if floor is None else min(floor, f["min"])
-                new_total += sum(1 for i in f["new"] if win_lo <= i <= win_hi)
-            if got_any:
-                error_retries = 0
+            try:
+                while True:
+                    got_any = False
+                    fetches, ses.fetches[:] = ses.fetches[:], []
+                    for f in fetches:
+                        if f["channel"] != channel_id:
+                            continue        # Discord preloads other channels too
+                        got_any = True
+                        if f["min"] is not None:
+                            floor = f["min"] if floor is None else min(floor, f["min"])
+                        new_total += sum(1 for i in f["new"] if win_lo <= i <= win_hi)
+                    if got_any:
+                        error_retries = 0
 
-            gaps = store.gaps(channel_id, win_lo, win_hi)
-            if not gaps:
-                if win_lo == 0:
-                    done_reason, outcome = "Reached the very top of the channel.", TOP
-                else:
-                    done_reason, outcome = "Reached the end date.", END_DATE
-            elif pacer.stopped:
-                done_reason, outcome = ("Stopped by user. Progress is kept — run the "
-                                        "job again to carry on from here."), STOPPED
-            elif pacer.out_of_time():
-                done_reason, outcome = "Time budget reached.", BUDGET
-            if done_reason:
-                break
+                    gaps = store.gaps(channel_id, win_lo, win_hi)
+                    if not gaps:
+                        if win_lo == 0:
+                            done_reason, outcome = "Reached the very top of the channel.", TOP
+                        else:
+                            done_reason, outcome = "Reached the end date.", END_DATE
+                    elif pacer.stopped:
+                        done_reason, outcome = ("Stopped by user. Progress is kept — run the "
+                                                "job again to carry on from here."), STOPPED
+                    elif pacer.out_of_time():
+                        done_reason, outcome = "Time budget reached.", BUDGET
+                    if done_reason:
+                        break
 
-            # Are we standing right above the next missing stretch? If not,
-            # jump straight to it instead of scrolling through covered ground.
-            # (A short covered stretch in between is simply scrolled through —
-            # cheaper and more natural than reloading the page.)
-            target_hi = gaps[0][1]
-            if not need_jump and floor is not None:
-                iv = store.interval_containing(channel_id, floor)
-                if not iv or iv[0] - 1 != target_hi:
-                    need_jump = True
-                elif store.count_in(channel_id, iv[0], floor - 1) > SKIP_BY_JUMP_MIN:
-                    need_jump = True
-            if need_jump:
-                tries = attempts.get(target_hi, 0)
-                if tries >= MAX_JUMP_TRIES:
-                    done_reason, outcome = (
-                        "WARNING: older history stopped loading and did not "
-                        "recover — saving what was captured. This scrape is "
-                        "INCOMPLETE; run it again later and it will carry on "
-                        "from where it stopped.", STALLED)
-                    break
-                attempts[target_hi] = tries + 1
-                when = snowflake_to_dt(target_hi)
-                log(f"Jumping to {when:%Y-%m-%d %H:%M} UTC in the channel..."
-                    + (f" (try {tries + 1})" if tries else ""))
-                await page.goto(f"https://discord.com/channels/{guild_id}/{channel_id}/{target_hi}")
-                floor, need_jump, idle_steps = None, False, 0
-                await pacer.nap(6, 10)
-                if not named:
-                    await ses.note_names(guild_id)
-                    named = True
-                    cname = store.name(channel_id)
-                    if cname:
-                        log(f"Channel: #{pretty_channel(cname)}"
-                            + (f" in {store.name(guild_id)}" if store.name(guild_id) else ""))
-                continue
+                    # Are we standing right above the next missing stretch? If not,
+                    # jump straight to it instead of scrolling through covered ground.
+                    # (A short covered stretch in between is simply scrolled through —
+                    # cheaper and more natural than reloading the page.)
+                    target_hi = gaps[0][1]
+                    if not need_jump and floor is not None:
+                        iv = store.interval_containing(channel_id, floor)
+                        if not iv or iv[0] - 1 != target_hi:
+                            need_jump = True
+                        elif store.count_in(channel_id, iv[0], floor - 1) > SKIP_BY_JUMP_MIN:
+                            need_jump = True
+                    if need_jump:
+                        tries = attempts.get(target_hi, 0)
+                        if tries >= MAX_JUMP_TRIES:
+                            done_reason, outcome = (
+                                "WARNING: older history stopped loading and did not "
+                                "recover — saving what was captured. This scrape is "
+                                "INCOMPLETE; run it again later and it will carry on "
+                                "from where it stopped.", STALLED)
+                            break
+                        attempts[target_hi] = tries + 1
+                        when = snowflake_to_dt(target_hi)
+                        log(f"Jumping to {when:%Y-%m-%d %H:%M} UTC in the channel..."
+                            + (f" (try {tries + 1})" if tries else ""))
+                        try:
+                            await pacer.run(page.goto(f"https://discord.com/channels/{guild_id}/{channel_id}/{target_hi}"), timeout=30)
+                        except PacerInterrupted as exc:
+                            done_reason, outcome = "Job stopped while opening the channel.", exc.outcome
+                            break
+                        floor, need_jump, idle_steps = None, False, 0
+                        await pacer.nap(6, 10)
+                        if not named:
+                            await ses.note_names(guild_id)
+                            named = True
+                            cname = store.name(channel_id)
+                            if cname:
+                                log(f"Channel: #{pretty_channel(cname)}"
+                                    + (f" in {store.name(guild_id)}" if store.name(guild_id) else ""))
+                        continue
 
-            # Discord erroring on history? Click Retry and back off rather
-            # than scrolling into a wall.
-            if not got_any and await page.evaluate(JS_FIND_RETRY):
-                error_retries += 1
-                if error_retries > MAX_ERROR_RETRIES:
-                    done_reason, outcome = (
-                        f"Discord kept failing to load older history after "
-                        f"{MAX_ERROR_RETRIES} retries — saving what was "
-                        f"captured. This scrape is INCOMPLETE.", STALLED)
-                    break
-                wait = random.uniform(ERROR_BACKOFF_MIN_S, ERROR_BACKOFF_MAX_S)
-                log(f"Discord could not load older messages — clicked Retry, "
-                    f"waiting {wait:.0f}s (attempt {error_retries})")
-                await pacer.nap(wait)
-                continue  # don't count this as an idle scroll step
+                    # Discord erroring on history? Click Retry and back off rather
+                    # than scrolling into a wall.
+                    if not got_any and await pacer.run(page.evaluate(JS_FIND_RETRY), timeout=10):
+                        error_retries += 1
+                        if error_retries > MAX_ERROR_RETRIES:
+                            done_reason, outcome = (
+                                f"Discord kept failing to load older history after "
+                                f"{MAX_ERROR_RETRIES} retries — saving what was "
+                                f"captured. This scrape is INCOMPLETE.", STALLED)
+                            break
+                        wait = random.uniform(ERROR_BACKOFF_MIN_S, ERROR_BACKOFF_MAX_S)
+                        log(f"Discord could not load older messages — clicked Retry, "
+                            f"waiting {wait:.0f}s (attempt {error_retries})")
+                        await pacer.nap(wait)
+                        continue  # don't count this as an idle scroll step
 
-            info = await page.evaluate(JS_SCROLLER)
-            idle_steps = 0 if got_any else idle_steps + 1
-            if not info:
-                log("WARNING: message list not found (channel still loading?)")
-                idle_steps += 3
-            else:
-                await page.keyboard.press("PageUp")
-            if idle_steps >= IDLE_STEPS_LIMIT:
-                # Nothing new is arriving. Jump back to the edge of what is
-                # missing: that either proves this is the channel's beginning
-                # or gives a stuck page a fresh start.
-                need_jump = True
-                continue
-            await pacer.step(progress)
+                    info = await pacer.run(page.evaluate(JS_SCROLLER), timeout=10)
+                    idle_steps = 0 if got_any else idle_steps + 1
+                    if not info:
+                        log("WARNING: message list not found (channel still loading?)")
+                        idle_steps += 3
+                    else:
+                        await pacer.run(page.keyboard.press("PageUp"), timeout=10)
+                    if idle_steps >= IDLE_STEPS_LIMIT:
+                        # Nothing new is arriving. Jump back to the edge of what is
+                        # missing: that either proves this is the channel's beginning
+                        # or gives a stuck page a fresh start.
+                        need_jump = True
+                        continue
+                    await pacer.step(progress)
 
-        log(done_reason)
-        images = ses.images_saved
-        if images_dir is not None and full_images and outcome in (END_DATE, TOP, STALLED):
-            await ses.fetch_full_images(store.images_in(channel_id, win_lo, win_hi))
+            except PacerInterrupted as exc:
+                done_reason, outcome = "Job stopped while waiting for Discord.", exc.outcome
+            except asyncio.TimeoutError:
+                done_reason = "Discord did not answer before the operation timeout. Progress is kept."
+                outcome = pacer.outcome() or STALLED
+
+            log(done_reason)
             images = ses.images_saved
-        if images:
-            log(f"Images saved this run: {images}")
+            if images_dir is not None and full_images and outcome in (END_DATE, TOP, STALLED):
+                await ses.fetch_full_images(store.images_in(channel_id, win_lo, win_hi))
+                images = ses.images_saved
+                if pacer.outcome() is not None:
+                    outcome = pacer.outcome()
+            if images:
+                log(f"Images saved this run: {images}")
+
+    except PacerInterrupted as exc:
+        outcome = exc.outcome
+    except asyncio.TimeoutError:
+        log("Discord browser startup or navigation timed out. Progress is kept.")
+        outcome = pacer.outcome() or STALLED
 
     return result(outcome or STALLED, new_total, images)

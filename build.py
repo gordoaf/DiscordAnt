@@ -36,7 +36,8 @@ RELEASE = BASE / "release"
 
 # The app's own modules. gui.py imports them inside a try/except, which
 # PyInstaller's import scan can miss, so each one is named here.
-MODULES = ("appinfo", "keep_awake", "scraper_core", "store", "jobs", "user_history")
+MODULES = ("appinfo", "keep_awake", "scraper_core", "store", "jobs", "user_history",
+           "exports", "persistence")
 
 VERSION_INFO = """\
 VSVersionInfo(

@@ -2,6 +2,7 @@
 can be tested without opening a window."""
 
 import re
+from pathlib import Path
 
 try:
     from . import scraper_core as sc
@@ -10,6 +11,7 @@ except ImportError:  # running as a plain script / frozen exe
 
 PENDING, RUNNING, DONE, FAILED, STOPPED = "pending", "running", "done", "failed", "stopped"
 INCOMPLETE = "incomplete"   # ran, saved data, but did NOT cover the whole range
+RESUMABLE = (PENDING, RUNNING, STOPPED, INCOMPLETE)
 CHANNEL_JOB, USER_JOB = "channel", "user"
 
 # A stand-in label made from the channel id ("channel 8435", "ch-8435"): it is
@@ -66,8 +68,15 @@ def file_name(job):
     span = f"{job.get('end') or 'start'}_to_{job.get('start') or 'now'}"
     if job.get("type") == USER_JOB:
         return (f"discord_user_{sc.safe_name(job.get('username'))}_"
-                f"{sc.safe_name(job.get('server') or 'server')}_{span}.json")
-    return f"discord_{sc.safe_name(job.get('label'))}_{span}.json"
+                f"{sc.safe_name(job.get('server') or 'server')[:40]}_"
+                f"g{job['guild_id']}_{span}.json")
+    return (f"discord_{sc.safe_name(job.get('label'))[:60]}_"
+            f"g{job['guild_id']}_c{job['channel_id']}_{span}.json")
+
+
+def output_paths(job):
+    out = Path(job["out"])
+    return [out, out.with_suffix(".md")] if job.get("type") == USER_JOB else [out]
 
 
 def new_job(kind, *, label, auto_label, guild_id, channel_id, start, end,
@@ -78,7 +87,8 @@ def new_job(kind, *, label, auto_label, guild_id, channel_id, start, end,
             "guild_id": str(guild_id), "channel_id": str(channel_id),
             "username": username, "server": server,
             "start": start, "end": end, "out": str(out), "auto_out": bool(auto_out),
-            "status": PENDING, "note": "", "fresh": False}
+            "status": PENDING, "note": "", "fresh": False,
+            "output_hashes": {}, "batch_id": "", "batch_run": ""}
 
 
 def fill_job(job):
@@ -86,23 +96,44 @@ def fill_job(job):
     False when the entry is not a usable job."""
     if not isinstance(job, dict):
         return False
-    if not all(job.get(k) for k in ("guild_id", "channel_id", "out")):
+    if not all(isinstance(job.get(k), str) and job[k]
+               for k in ("guild_id", "channel_id", "out")):
+        return False
+    if not job["guild_id"].isdigit() or not job["channel_id"].isdigit():
+        return False
+    if "\x00" in job["out"]:
         return False
     job.setdefault("type", CHANNEL_JOB)
+    if job["type"] not in (CHANNEL_JOB, USER_JOB):
+        return False
     job.setdefault("username", "")
     job.setdefault("server", "")
     job.setdefault("label", placeholder(job["channel_id"]))
+    if not all(isinstance(job.get(k), str) for k in ("username", "server", "label")):
+        return False
     job.setdefault("auto_label", is_placeholder(job["label"]))
     for k in ("start", "end", "note"):
         if not isinstance(job.get(k), str):
             job[k] = ""
     job.setdefault("status", PENDING)
+    if job["status"] not in (*RESUMABLE, DONE, FAILED):
+        job["status"] = INCOMPLETE
     job.setdefault("fresh", False)
+    if not all(isinstance(job.get(k, False), bool) for k in ("auto_label", "auto_out", "fresh")):
+        return False
     if "auto_out" not in job:
         name = job["out"].replace("\\", "/").rsplit("/", 1)[-1]
         job["auto_out"] = name == file_name(job)
     if job["type"] == USER_JOB and not job["username"]:
         return False
+    for key in ("batch_id", "batch_run"):
+        if not isinstance(job.get(key), str):
+            job[key] = ""
+    hashes = job.get("output_hashes")
+    if not isinstance(hashes, dict) or not all(
+            isinstance(k, str) and (v is None or isinstance(v, str))
+            for k, v in hashes.items()):
+        job["output_hashes"] = {}
     return True
 
 
@@ -113,7 +144,8 @@ def outcome_status(job, res):
     outcome = res.get("outcome")
     if outcome == sc.STOPPED:
         return STOPPED, f"{count} messages so far"
-    if kind == USER_JOB and not res.get("author_id") and outcome != sc.BUDGET:
+    if (kind == USER_JOB and not res.get("author_id") and outcome != sc.BUDGET
+            and not res.get("deferred_recent")):
         return FAILED, (res.get("note")
                         or f"no user called '{job.get('username')}' was found")
     if outcome in (sc.END_DATE, sc.TOP):

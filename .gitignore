@@ -20,3 +20,6 @@ images/
 queue.json
 batches.json
 gui_settings.json
+queue.json.bak
+batches.json.bak
+gui_settings.json.bak

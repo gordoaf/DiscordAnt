@@ -23,6 +23,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,7 +46,7 @@ if getattr(sys, "frozen", False):
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_cache)
 
 try:
-    from . import jobs, keep_awake, scraper_core, user_history
+    from . import exports, jobs, keep_awake, persistence, scraper_core, user_history
     from .appinfo import APP_NAME, HOMEPAGE, __version__
     from .jobs import (CHANNEL_JOB, DONE, FAILED, INCOMPLETE, PENDING, RUNNING,
                        STOPPED, USER_JOB)
@@ -53,6 +54,8 @@ try:
     from .store import Store
 except ImportError:  # running as a plain script / frozen exe
     import jobs
+    import exports
+    import persistence
     import keep_awake
     import scraper_core
     import user_history
@@ -92,8 +95,8 @@ Channel — one channel. Right-click the channel in Discord, Copy Link, paste
 it in. Leave the label blank and the channel's real name is used.
 
 Batch — a saved set of channels. Pick the batch and one press queues a job
-for every channel in it. Picking a batch fills in the end date with the day
-it was last queued, so the default is "everything since last time".
+for every channel in it. Picking a batch fills in the end date from successful
+collection. Failed or pending jobs never advance the next top-up date.
 
 User — every message one person posted in a server, grouped by channel, each
 with the conversation around it and what it was replying to. You get a .json
@@ -154,6 +157,39 @@ search box and opens old conversations, at the same unhurried pace.
 That pace is not a promise of safety. Automating a personal account is
 against Discord's terms, and using this app is at your own risk.
 """
+
+
+def _valid_settings(value):
+    if not isinstance(value, dict):
+        return False
+    strings = ("last_out_dir", "last_batch", "last_server", "budget")
+    booleans = ("batch_dated_dir", "keep_awake", "save_images", "full_images")
+    return (all(k not in value or isinstance(value[k], str) for k in strings)
+            and all(k not in value or isinstance(value[k], bool) for k in booleans))
+
+
+def _valid_batches(value):
+    if not isinstance(value, list):
+        return False
+    for batch in value:
+        if (not isinstance(batch, dict) or not isinstance(batch.get("name"), str)
+                or not batch["name"] or not isinstance(batch.get("channels"), list)):
+            return False
+        for channel in batch["channels"]:
+            if (not isinstance(channel, dict)
+                    or not all(isinstance(channel.get(k), str) and channel[k].isdigit()
+                               for k in ("guild_id", "channel_id"))
+                    or not isinstance(channel.get("label", ""), str)):
+                return False
+        for key in ("id", "out_dir", "last_requested", "last_successful"):
+            if key in batch and not isinstance(batch[key], str):
+                return False
+        for key in ("completed", "requested_from", "covered_from"):
+            mapping = batch.get(key, {})
+            if not isinstance(mapping, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()):
+                return False
+    return True
 
 
 class Tip:
@@ -337,7 +373,7 @@ class ScraperApp:
         self.batch_box.pack(side="left")
         self.batch_box.bind("<<ComboboxSelected>>", self._on_batch_selected)
         Tip(self.batch_box, "A batch is a saved set of channels. Picking one fills in "
-                            "the end date with the day it was last queued.")
+                            "the end date from successful collection.")
         self.batch_info = tk.StringVar(value="no batches saved yet")
         ttk.Label(box, textvariable=self.batch_info, foreground=GREY).pack(
             side="left", padx=10)
@@ -406,7 +442,7 @@ class ScraperApp:
                 ("Move down", lambda: self._move(1), ""),
                 ("Remove selected", self._remove_selected, ""),
                 ("Clear finished", self._clear_finished,
-                 "Removes done and failed jobs. Stopped and incomplete jobs stay: "
+                 "Removes done jobs. Failed, stopped and incomplete jobs stay: "
                  "they resume when you press Start queue."),
                 ("Run again", self._run_again,
                  "Runs the selected jobs again. Only what the archive doesn't "
@@ -551,10 +587,48 @@ class ScraperApp:
             raise ValueError(f"Folder does not exist: {folder}")
         return folder, explicit
 
-    def _check_free(self, out, also=()):
-        if any(j["out"] == out and j["status"] in (PENDING, RUNNING)
-               for j in list(self.jobs) + list(also)):
-            raise ValueError(f"A pending job already writes to {Path(out).name}.")
+    def _check_free(self, out, also=(), kind=CHANNEL_JOB, ignore=None):
+        candidate = {"out": str(out), "type": kind}
+        for job in list(self.jobs) + list(also):
+            if job is ignore:
+                continue
+            if any(exports.same_path(a, b) for a in jobs.output_paths(candidate)
+                   for b in jobs.output_paths(job)):
+                raise ValueError(f"Another queued job owns {Path(out).name}. "
+                                 "Choose a different output file.")
+
+    def _approve_outputs(self, job):
+        expected = job.get("output_hashes", {})
+        actual = {exports.path_key(p): exports.fingerprint(p)
+                  for p in jobs.output_paths(job)}
+        changed = [p for p in jobs.output_paths(job)
+                   if actual[exports.path_key(p)] is not None
+                   and expected.get(exports.path_key(p)) != actual[exports.path_key(p)]]
+        if changed and not messagebox.askyesno(
+                "Replace existing output?",
+                "These files already exist or changed outside this job:\n\n"
+                + "\n".join(str(p) for p in changed)
+                + "\n\nAllow this job to replace them?", default="no"):
+            raise ValueError("Output replacement was not approved. Choose another file.")
+        job["output_hashes"] = actual
+
+    def _prepare_output(self, job, also=()):
+        base = Path(job["out"])
+        if job.get("auto_out"):
+            for number in range(1, 10001):
+                job["out"] = str(base if number == 1 else
+                                 base.with_name(f"{base.stem}_{number}{base.suffix}"))
+                try:
+                    self._check_free(job["out"], also, job["type"])
+                except ValueError:
+                    continue
+                if not any(p.exists() for p in jobs.output_paths(job)):
+                    break
+            else:
+                raise ValueError("Could not find an unused output filename.")
+        else:
+            self._check_free(job["out"], also, job["type"])
+        self._approve_outputs(job)
 
     def _enqueue(self, new, folder):
         self.jobs.extend(new)
@@ -576,7 +650,7 @@ class ScraperApp:
                                guild_id=guild_id, channel_id=channel_id,
                                start=start, end=end, auto_out=explicit is None)
             job["out"] = str(explicit or folder / jobs.file_name(job))
-            self._check_free(job["out"])
+            self._prepare_output(job)
         except ValueError as e:
             messagebox.showerror("Check the job", str(e))
             return
@@ -617,7 +691,7 @@ class ScraperApp:
                                    auto_out=explicit is None, username=name,
                                    server=server)
                 job["out"] = str(explicit or folder / jobs.file_name(job))
-                self._check_free(job["out"], new)
+                self._prepare_output(job, new)
                 new.append(job)
         except ValueError as e:
             messagebox.showerror("Check the job", str(e))
@@ -688,20 +762,37 @@ class ScraperApp:
             return
         old = Path(job["out"])
         new = old.with_name(jobs.file_name(job))
-        if new == old or any(j is not job and j["out"] == str(new)
-                             for j in list(self.jobs)):
-            return
-        if old.exists() and new.exists():
+        if exports.same_path(new, old):
             return
         try:
-            if old.exists():
-                os.replace(old, new)
-                md_old, md_new = old.with_suffix(".md"), new.with_suffix(".md")
-                if job["type"] == USER_JOB and md_old.exists() and not md_new.exists():
-                    os.replace(md_old, md_new)
+            self._check_free(new, kind=job["type"], ignore=job)
+        except ValueError:
+            return
+        new_paths = jobs.output_paths({**job, "out": str(new)})
+        if any(p.exists() for p in new_paths):
+            return
+        old_paths = jobs.output_paths(job)
+        expected = job.get("output_hashes", {})
+        if any(p.exists() and expected.get(exports.path_key(p)) != exports.fingerprint(p)
+               for p in old_paths):
+            return
+        moved = []
+        try:
+            for before, after in zip(old_paths, new_paths):
+                if before.exists():
+                    before.rename(after)
+                    moved.append((before, after))
         except OSError:
+            for before, after in reversed(moved):
+                try:
+                    if not before.exists():
+                        after.rename(before)
+                except OSError as exc:
+                    self._log(f"WARNING: output rename rollback failed: {exc}")
             return
         job["out"] = str(new)
+        job["output_hashes"] = {exports.path_key(p): exports.fingerprint(p)
+                                for p in new_paths}
 
     def _apply_known_names(self, sync_files=False):
         """Put real channel and server names wherever a stand-in is still
@@ -791,9 +882,9 @@ class ScraperApp:
         if not b:
             self.batch_info.set("no batches yet — 'New...' makes one")
             return
-        last = b.get("last_queued")
+        last = self._batch_success_date(b)
         self.batch_info.set(f"{len(b.get('channels', []))} channel(s)" +
-                            (f" · last queued {last}" if last else " · never queued"))
+                            (f" · collected through {last}" if last else " · baseline incomplete"))
 
     def _on_batch_selected(self, _event=None):
         self._prefill_batch_dates()
@@ -805,14 +896,25 @@ class ScraperApp:
         if not b:
             return
         # A top-up run normally wants "everything since the last one", so the
-        # end (oldest) date defaults to the day this batch was last queued.
+        # Never trust the legacy enqueue timestamp as completed collection.
         self.start_var.set("")
-        self.end_var.set(b.get("last_queued", ""))
+        self.end_var.set(self._batch_success_date(b))
         out_dir = b.get("out_dir", "")
         if out_dir and Path(out_dir).exists():
             self.out_var.set(out_dir)
         self._log(f"Batch '{b['name']}': {len(b.get('channels', []))} channel(s)"
-                  + (f", back to {b['last_queued']}" if b.get("last_queued") else ""))
+                  + (f", back to {self._batch_success_date(b)}"
+                     if self._batch_success_date(b) else ", no completed baseline yet"))
+
+    def _batch_success_date(self, batch):
+        completed = batch.get("completed", {})
+        requested = batch.get("requested_from", {})
+        covered = batch.get("covered_from", {})
+        dates = [completed.get(c["channel_id"], "")
+                 if c["channel_id"] in covered and
+                 covered[c["channel_id"]] <= requested.get(c["channel_id"], "") else ""
+                 for c in batch["channels"]]
+        return min(dates) if dates and all(dates) else ""
 
     def _edit_batch(self, new=False):
         if new:
@@ -855,6 +957,7 @@ class ScraperApp:
             existing["name"] = edited["name"]
             existing["channels"] = edited["channels"]
         else:
+            edited["id"] = uuid.uuid4().hex
             self.batches.append(edited)
         self.batches.sort(key=lambda b: b["name"].lower())
         self._save_batches()
@@ -892,7 +995,7 @@ class ScraperApp:
             raise ValueError(f"Folder does not exist: {base}")
         if not self.dated_var.get():
             return base, base
-        run = base / datetime.now().strftime("%m-%d")
+        run = base / datetime.now().strftime("%Y-%m-%d")
         try:
             run.mkdir(exist_ok=True)
         except OSError as e:
@@ -926,6 +1029,8 @@ class ScraperApp:
             return
 
         added, skipped = 0, []
+        batch.setdefault("id", uuid.uuid4().hex)
+        batch_run = uuid.uuid4().hex
         for ch in batch["channels"]:
             label, auto = self._label_for(ch["guild_id"], ch["channel_id"],
                                           ch.get("label"))
@@ -933,19 +1038,30 @@ class ScraperApp:
                                guild_id=ch["guild_id"], channel_id=ch["channel_id"],
                                start=start_raw, end=end_raw)
             job["out"] = str(folder / jobs.file_name(job))
-            clash = next((j for j in self.jobs if j["out"] == job["out"]
-                          and j["status"] in (PENDING, RUNNING)), None)
-            if clash and clash["channel_id"] == job["channel_id"]:
+            clash = next((j for j in self.jobs
+                          if j["type"] == CHANNEL_JOB
+                          and j["guild_id"] == job["guild_id"]
+                          and j["channel_id"] == job["channel_id"]
+                          and j["start"] == start_raw and j["end"] == end_raw
+                          and j["status"] in jobs.RESUMABLE), None)
+            if clash:
                 skipped.append(label)
                 continue
-            if clash:   # two channels with the same label: tell the files apart
-                job["label"] = f"{label} {ch['channel_id'][-4:]}"
-                job["auto_label"] = False
-                job["out"] = str(folder / jobs.file_name(job))
+            try:
+                self._prepare_output(job)
+            except ValueError as exc:
+                self._log(f"Could not queue {label}: {exc}")
+                skipped.append(label)
+                continue
+            job["batch_id"] = batch["id"]
+            job["batch_run"] = batch_run
+            requested = batch.setdefault("requested_from", {})
+            previous = requested.get(job["channel_id"], end_raw)
+            requested[job["channel_id"]] = min(previous, end_raw)
             self.jobs.append(job)
             added += 1
 
-        batch["last_queued"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        batch["last_requested"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         batch["out_dir"] = str(base)
         self._save_batches()
         self.settings["last_out_dir"] = str(base)
@@ -1007,9 +1123,9 @@ class ScraperApp:
 
     def _clear_finished(self):
         before = len(self.jobs)
-        # Stopped and incomplete jobs stay: they still have history to collect.
+        # Failed jobs also stay: clearing them would hide uncollected history.
         self.jobs = [j for j in self.jobs
-                     if j["status"] in (PENDING, RUNNING, INCOMPLETE, STOPPED)]
+                     if j["status"] != DONE]
         self._refresh_tree()
         self._save_queue()
         self._log(f"Cleared {before - len(self.jobs)} finished job(s).")
@@ -1132,6 +1248,10 @@ class ScraperApp:
                                 "job and press 'Run again'.")
             return
         try:
+            for job in self.jobs:
+                if job["status"] in (PENDING, STOPPED, INCOMPLETE):
+                    self._check_free(job["out"], kind=job["type"], ignore=job)
+                    self._approve_outputs(job)
             opts = self._capture_options()
         except ValueError as e:
             messagebox.showerror("Check the options", str(e))
@@ -1168,8 +1288,6 @@ class ScraperApp:
                 if job is None or self._halted():
                     break
                 job["status"], job["note"] = RUNNING, ""
-                self._relabel(job)
-                self._sync_out(job)
                 pend = sum(1 for j in self.jobs if j["status"] == PENDING)
                 self._ui(self._refresh_tree)
                 self._ui(lambda l=job["label"], p=pend: self.status_var.set(
@@ -1178,6 +1296,9 @@ class ScraperApp:
                 self._log(f"===== {job['label']}: {job['end'] or 'the beginning'} "
                           f"to {job['start'] or 'now'} =====")
                 try:
+                    self._relabel(job)
+                    self._sync_out(job)
+                    self._check_free(job["out"], kind=job["type"], ignore=job)
                     self._run_job(job, opts, totals)
                 except ValueError as e:
                     job["status"], job["note"] = FAILED, str(e)
@@ -1220,6 +1341,12 @@ class ScraperApp:
             self._ui(self._reset_buttons)
 
     def _run_job(self, job, opts, totals):
+        with exports.authorized(job.get("output_hashes", {}),
+                                lambda hashes: job.update(output_hashes=hashes)):
+            self._execute_job(job, opts, totals)
+
+    def _execute_job(self, job, opts, totals):
+        run_started = datetime.now(timezone.utc)
         start_dt = self._parse_date(job["start"], "Start date", True)
         end_dt = self._parse_date(job["end"], "End date", False)
         fresh, job["fresh"] = bool(job["fresh"]), False
@@ -1239,6 +1366,8 @@ class ScraperApp:
 
         status, note = jobs.outcome_status(job, res)
         job["status"], job["note"] = status, note
+        if status == DONE and job.get("batch_id") and job["type"] == CHANNEL_JOB:
+            self._ui(lambda j=dict(job), when=run_started: self._record_batch_success(j, when))
         totals[status] += 1
         totals["messages"] += res.get("count", 0)
         totals["new"] += res.get("new", 0)
@@ -1250,6 +1379,24 @@ class ScraperApp:
         # The job may have just learned the channel's real name.
         self._relabel(job)
         self._sync_out(job)
+
+    def _record_batch_success(self, job, started):
+        batch = next((b for b in self.batches if b.get("id") == job["batch_id"]), None)
+        if batch is None:
+            return
+        ch = job["channel_id"]
+        old = batch.setdefault("completed", {}).get(ch, "")
+        covered = batch.setdefault("covered_from", {})
+        required = batch.get("requested_from", {}).get(ch, job["end"])
+        if job["end"] <= required or (old and job["end"] <= old):
+            through = min(job["start"] or started.strftime("%Y-%m-%d"),
+                          started.strftime("%Y-%m-%d"))
+            if old and job["start"] and through < covered.get(ch, job["end"]):
+                return  # A disjoint older range does not extend the baseline.
+            covered[ch] = min(covered.get(ch, job["end"]), job["end"])
+            batch["completed"][ch] = max(old, through)
+            batch["last_successful"] = self._batch_success_date(batch)
+            self._save_batches()
 
     def _reset_buttons(self):
         self.pause_event.clear()
@@ -1383,53 +1530,38 @@ class ScraperApp:
 
     # ---------------- persistence ----------------
     def _load_settings(self):
-        if SETTINGS_FILE.exists():
-            try:
-                return json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
-            except Exception:
-                pass
-        return {}
+        return persistence.load(SETTINGS_FILE, _valid_settings, {}, self._log)
 
     def _save_settings(self):
         try:
-            SETTINGS_FILE.write_text(json.dumps(self.settings, indent=1), encoding="utf-8")
-        except Exception:
-            pass
+            persistence.save(SETTINGS_FILE, self.settings, _valid_settings)
+        except Exception as exc:
+            self._log(f"WARNING: could not save settings: {exc}")
 
     def _load_batches(self):
-        if BATCHES_FILE.exists():
-            try:
-                batches = json.loads(BATCHES_FILE.read_text(encoding="utf-8-sig"))
-                return [b for b in batches if b.get("name")]
-            except Exception:
-                pass
-        return []
+        batches = persistence.load(BATCHES_FILE, _valid_batches, [], self._log)
+        for batch in batches:
+            batch.setdefault("id", uuid.uuid4().hex)
+        return batches
 
     def _save_batches(self):
         try:
-            BATCHES_FILE.write_text(json.dumps(self.batches, indent=1),
-                                    encoding="utf-8")
+            persistence.save(BATCHES_FILE, self.batches, _valid_batches)
         except Exception as e:
             self._log(f"WARNING: could not save batches: {e}")
 
     def _save_queue(self):
         try:
-            QUEUE_FILE.write_text(json.dumps(self.jobs, indent=1), encoding="utf-8")
-        except Exception:
-            pass
+            persistence.save(QUEUE_FILE, self.jobs)
+        except Exception as exc:
+            self._log(f"WARNING: could not save queue: {exc}")
 
     def _load_queue(self):
-        if not QUEUE_FILE.exists():
-            return
-        try:
-            loaded = json.loads(QUEUE_FILE.read_text(encoding="utf-8-sig"))
-        except Exception:
-            return
-        if not isinstance(loaded, list):
-            return
+        loaded = persistence.load(QUEUE_FILE, lambda value: isinstance(value, list), [], self._log)
         kept = []
         for j in loaded:
             if not jobs.fill_job(j):     # also adds the keys older versions lacked
+                self._log("WARNING: skipped an invalid saved queue entry.")
                 continue
             if j["status"] == RUNNING:   # app closed mid-job last time
                 j["status"], j["note"] = PENDING, ""
@@ -1650,9 +1782,16 @@ def _hold_running_mark():
     may be in the middle of a queue. Released when the app exits."""
     try:
         import ctypes
-        return ctypes.windll.kernel32.CreateMutexW(None, False, APP_NAME + "Running")
-    except Exception:
-        return None
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel.CreateMutexW(None, False, APP_NAME + "Running")
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return handle, ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    except AttributeError:  # Non-Windows source runs.
+        return None, False
 
 
 def main():
@@ -1661,8 +1800,13 @@ def main():
     if "--selftest" in sys.argv:
         selftest()
         return
-    mark = _hold_running_mark()     # noqa: F841 (kept alive until exit)
+    mark, already_running = _hold_running_mark()  # kept alive until exit
     root = tk.Tk()
+    if already_running:
+        root.withdraw()
+        messagebox.showinfo(APP_NAME, "DiscordAnt is already open. Use its existing window.")
+        root.destroy()
+        return
     try:
         ttk.Style().theme_use("vista")
     except tk.TclError:

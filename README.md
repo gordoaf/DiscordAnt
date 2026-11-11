@@ -110,8 +110,9 @@ A batch is a named set of channels, for the ones you come back to. **New...**
 makes one: give it a name and paste the channel links. After that, pick the
 batch and press **Queue batch** to get one job per channel.
 
-Picking a batch fills in the end date with the day it was last queued, so the
-default is "everything since last time". If the end date is blank the app
+Picking a batch fills in the end date from successfully collected history,
+using the oldest completed date across its channels. Failed or pending jobs
+never advance it. If the end date is blank the app
 asks first, because that means every channel back to its beginning. Tick
 **Batches into a dated subfolder** and each run gets its own folder.
 
@@ -157,13 +158,16 @@ one was saved.
 | Save as batch... | Turns the channels in the queue into a batch |
 
 A job that fails does not stop the queue: it is marked `failed` and the next
-one starts. The queue is saved and comes back the next time you open the app.
+one starts. **Clear finished** removes only successful jobs; failed and
+unfinished jobs stay visible. The queue is saved and comes back the next time
+you open the app. Settings, batches and the queue use atomic writes and a
+last-good `.bak` file; recovery problems appear in the log.
 
 **Keep PC awake** stops the PC going to sleep while the queue runs (closing a
 laptop lid still suspends it). **Per-job limit** stops a job after that many
 minutes and marks it `incomplete`, ready to be carried on later.
 
-## Nothing is collected twice
+## Resuming and completeness
 
 Every message is kept in one archive on your PC, with a record of which
 stretches of each channel have been read in full. A job only scrolls through
@@ -174,6 +178,42 @@ the part of its dates the archive does not hold yet.
 - Asking for dates you already have opens no browser at all. The file is
   simply written from the archive.
 - Overlapping dates cost only the part that is new.
+
+User jobs verify that Discord's search is newest first and that each result
+page belongs to the requested person, server and date range. If the app
+cannot verify that, it stops with a useful note rather than claiming the
+range is complete. An unknown person with no results needs a verifiable
+profile suggestion or an identity already learned from a channel collection.
+
+Discord's search index can lag. User jobs leave the newest 15 minutes pending
+and show an `incomplete` status until a later run collects them. Their JSON
+contains completeness fields including `complete`, `deferred_recent`,
+`searched_through`, `search_cutoff` and `requested_through`. The transcript
+shows the same collection note. **Start over** reloads full messages and
+conversation context, including edits; an interrupted refresh resumes later.
+
+### Updating an older archive
+
+Version 1.0.1 preserves existing messages, pictures and old index evidence.
+It rebuilds image references and stops trusting completion markers from
+1.0.0, because those markers could hide gaps. The next jobs may therefore
+recheck previously collected history once. This does not delete your archive
+or your old export files.
+
+### Output files
+
+Automatic names include the full server/channel IDs. Existing files receive
+a different unused name. An explicitly chosen existing file needs your
+approval, and a file changed by another program during collection is left
+alone. Every queued job reserves its JSON and, for user jobs, its Markdown
+transcript, including while stopped or incomplete. Only one Windows app
+instance can run at a time.
+
+Pictures are limited to supported raster formats, 20 MiB per download and
+100 MiB per job. Image downloads use a separate HTTPS connection to allowed
+Discord CDN hosts, with no login, cookies, redirects or web-page rendering.
+Unsupported or failed downloads are skipped and the first failures are
+reported in the log; a saved preview remains available when full-size fails.
 
 ## What the files look like
 
@@ -265,10 +305,45 @@ pip install -r requirements-build.txt
 python build.py --installer
 ```
 
+Release builds use Windows x64 and Python 3.14. Install the reviewed dependency
+versions with wheel hashes:
+
+```
+python -m pip install --require-hashes --only-binary=:all: -r requirements-build-win-py314.lock
+python -m unittest discover -s tests -t . -v
+python build.py --installer
+```
+
 This makes the app folder in `dist\`, copies the browser into it, runs the
 build's self-test in an empty user folder, and packs
 `release\DiscordAnt-Setup-<version>.exe`. The installer step needs
 [Inno Setup 6](https://jrsoftware.org/isinfo.php).
+
+Each GitHub release build verifies the version tag, runs offline regressions
+and the bundled-browser self-test, then publishes the installer, `SHA256SUMS`
+and `provenance.json`. Compare the installer's hash before running it:
+
+```
+Get-FileHash .\DiscordAnt-Setup-1.0.1.exe -Algorithm SHA256
+```
+
+Provenance records the source commit, dependency lock hashes, Python version,
+bundled browser revision and actual Windows signature status. It is build
+evidence, not a signed attestation or a promise of byte-identical builds.
+Installers remain unsigned unless the owner provisions a trusted code-signing
+certificate on the release runner and sets `WINDOWS_SIGNING_THUMBPRINT`.
+No signing key or certificate is included in the repository.
+
+To refresh dependencies, update the pinned requirements, install them in a
+fresh Windows/Python 3.14 environment, run `scripts/lock_dependencies.py`,
+review the new locks, then run the tests and package self-test. Check
+Playwright/Chromium security updates at least monthly and before each release;
+browser updates ship in a new installer. GitHub Actions are pinned to exact
+commits and should be reviewed when updated.
+
+The regression suite uses synthetic messages and temporary app-data folders.
+It does not use your Discord login or saved archive. A controlled live test
+is still useful when Discord changes its page layout or search controls.
 
 | File | Job |
 |---|---|
