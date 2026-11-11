@@ -46,14 +46,19 @@ jobs:
           python -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest discover -s tests -t . -v
-      - name: Ensure Inno Setup is available
+      - name: Install hash-verified Inno Setup compiler
         shell: pwsh
         run: |
-          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path -LiteralPath $compiler)) {
-            choco install innosetup --version=6.7.4 --yes --no-progress
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.4.exe'
+          $compilerDir = Join-Path $env:RUNNER_TEMP 'DiscordAnt-InnoSetup'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe' -OutFile $setup
+          $expected = 'a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c'
+          if ((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Inno Setup installer hash mismatch' }
+          $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', '/NOICONS', ('/DIR="' + $compilerDir + '"'))
+          $process = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw 'Inno Setup compiler installation failed' }
+          if (-not (Test-Path -LiteralPath (Join-Path $compilerDir 'ISCC.exe'))) { throw 'Pinned compiler is missing' }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $compilerDir
       - name: Build installer and isolated bundled-browser self-test
         run: python build.py --installer
       - name: Optionally sign installer using owner's provisioned certificate
