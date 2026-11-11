@@ -39,7 +39,8 @@ jobs:
       - name: Validate exact version and tag source
         run: python -c "import os; from scripts.release_metadata import app_version,validate_tag,git_info,ROOT; tag=os.environ['RELEASE_TAG']; validate_tag(tag,app_version()); git_info(ROOT,tag,require_clean=True)"
       - name: Install reviewed hash-locked build dependencies
-        run: python -m pip install --require-hashes --only-binary=:all: -r requirements-build-win-py314.lock
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-build-win-py314.lock
       - name: Verify dependencies and regressions
         run: |
           python -m pip check
