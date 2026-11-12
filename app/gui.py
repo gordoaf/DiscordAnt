@@ -192,6 +192,38 @@ def _valid_batches(value):
     return True
 
 
+def _repair_batch(batch):
+    """One saved batch, tidied so that a single odd value cannot cost the
+    whole list: ids saved as numbers become text, an empty label becomes '',
+    a channel that cannot be used is dropped, and bookkeeping in the wrong
+    shape is forgotten (it is rebuilt by the next run). None = unusable."""
+    if not isinstance(batch, dict) or not isinstance(batch.get("name"), str) \
+            or not batch["name"]:
+        return None
+    channels = []
+    for channel in batch.get("channels") if isinstance(batch.get("channels"), list) else []:
+        if not isinstance(channel, dict):
+            continue
+        ids = {k: str(channel.get(k)) for k in ("guild_id", "channel_id")
+               if isinstance(channel.get(k), (str, int)) and not isinstance(channel.get(k), bool)}
+        if len(ids) != 2 or not all(v.isdigit() for v in ids.values()):
+            continue
+        fixed = dict(channel, **ids)
+        if not isinstance(fixed.get("label", ""), str):
+            fixed["label"] = ""
+        channels.append(fixed)
+    fixed = dict(batch, channels=channels)
+    for key in ("id", "out_dir", "last_requested", "last_successful"):
+        if key in fixed and not isinstance(fixed[key], str):
+            del fixed[key]
+    for key in ("completed", "requested_from", "covered_from"):
+        mapping = fixed.get(key, {})
+        if not isinstance(mapping, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()):
+            fixed.pop(key, None)
+    return fixed if _valid_batches([fixed]) else None
+
+
 class Tip:
     """A small hint that appears when the mouse rests on a widget."""
 
@@ -590,7 +622,8 @@ class ScraperApp:
     def _check_free(self, out, also=(), kind=CHANNEL_JOB, ignore=None):
         candidate = {"out": str(out), "type": kind}
         for job in list(self.jobs) + list(also):
-            if job is ignore:
+            # A job that is finished (or failed) no longer holds its file.
+            if job is ignore or job.get("status", PENDING) not in jobs.RESUMABLE:
                 continue
             if any(exports.same_path(a, b) for a in jobs.output_paths(candidate)
                    for b in jobs.output_paths(job)):
@@ -882,9 +915,9 @@ class ScraperApp:
         if not b:
             self.batch_info.set("no batches yet — 'New...' makes one")
             return
-        last = self._batch_success_date(b)
+        since, how = self._batch_since(b)
         self.batch_info.set(f"{len(b.get('channels', []))} channel(s)" +
-                            (f" · collected through {last}" if last else " · baseline incomplete"))
+                            (f" · {how} {since}" if since else " · not collected yet"))
 
     def _on_batch_selected(self, _event=None):
         self._prefill_batch_dates()
@@ -896,25 +929,38 @@ class ScraperApp:
         if not b:
             return
         # A top-up run normally wants "everything since the last one", so the
-        # Never trust the legacy enqueue timestamp as completed collection.
+        # end (oldest) date defaults to the day this batch is collected through.
+        since, how = self._batch_since(b)
         self.start_var.set("")
-        self.end_var.set(self._batch_success_date(b))
+        self.end_var.set(since)
         out_dir = b.get("out_dir", "")
         if out_dir and Path(out_dir).exists():
             self.out_var.set(out_dir)
         self._log(f"Batch '{b['name']}': {len(b.get('channels', []))} channel(s)"
-                  + (f", back to {self._batch_success_date(b)}"
-                     if self._batch_success_date(b) else ", no completed baseline yet"))
+                  + (f", {how} {since}" if since else ", not collected yet"))
 
     def _batch_success_date(self, batch):
+        """The day every channel of the batch is collected through, or ''.
+
+        Only jobs that finished count, so a failed or waiting job never moves
+        it; the oldest channel decides, so nothing is skipped by a top-up."""
         completed = batch.get("completed", {})
-        requested = batch.get("requested_from", {})
-        covered = batch.get("covered_from", {})
-        dates = [completed.get(c["channel_id"], "")
-                 if c["channel_id"] in covered and
-                 covered[c["channel_id"]] <= requested.get(c["channel_id"], "") else ""
-                 for c in batch["channels"]]
+        dates = [completed.get(c["channel_id"], "") for c in batch["channels"]]
         return min(dates) if dates and all(dates) else ""
+
+    def _batch_since(self, batch):
+        """(date, wording) for the End box of a top-up.
+
+        Normally the day the batch is collected through. A batch that has not
+        completed a run with this version yet falls back to the day an older
+        version last queued it, which is what that version offered."""
+        done = self._batch_success_date(batch)
+        if done:
+            return done, "collected through"
+        legacy = batch.get("last_queued")
+        if isinstance(legacy, str) and legacy:
+            return legacy, "last queued"
+        return "", ""
 
     def _edit_batch(self, new=False):
         if new:
@@ -1055,9 +1101,6 @@ class ScraperApp:
                 continue
             job["batch_id"] = batch["id"]
             job["batch_run"] = batch_run
-            requested = batch.setdefault("requested_from", {})
-            previous = requested.get(job["channel_id"], end_raw)
-            requested[job["channel_id"]] = min(previous, end_raw)
             self.jobs.append(job)
             added += 1
 
@@ -1381,22 +1424,32 @@ class ScraperApp:
         self._sync_out(job)
 
     def _record_batch_success(self, job, started):
+        """A batch job finished: move that channel's "collected through" day.
+
+        Each channel keeps one unbroken stretch, from covered_from to
+        completed. The first finished job starts it. A later job extends it
+        only when it joins on: one that begins after the stretch ends would
+        leave a hole that the next top-up must still fill, and one that ends
+        before the stretch begins says nothing about its newer end."""
         batch = next((b for b in self.batches if b.get("id") == job["batch_id"]), None)
         if batch is None:
             return
         ch = job["channel_id"]
-        old = batch.setdefault("completed", {}).get(ch, "")
+        done = batch.setdefault("completed", {})
         covered = batch.setdefault("covered_from", {})
-        required = batch.get("requested_from", {}).get(ch, job["end"])
-        if job["end"] <= required or (old and job["end"] <= old):
-            through = min(job["start"] or started.strftime("%Y-%m-%d"),
-                          started.strftime("%Y-%m-%d"))
-            if old and job["start"] and through < covered.get(ch, job["end"]):
-                return  # A disjoint older range does not extend the baseline.
-            covered[ch] = min(covered.get(ch, job["end"]), job["end"])
-            batch["completed"][ch] = max(old, through)
-            batch["last_successful"] = self._batch_success_date(batch)
-            self._save_batches()
+        today = started.strftime("%Y-%m-%d")
+        through = min(job["start"] or today, today)
+        old = done.get(ch, "")
+        if not old or ch not in covered:
+            done[ch], covered[ch] = through, job["end"]
+        elif job["end"] <= old and through >= covered[ch]:
+            done[ch] = max(old, through)
+            covered[ch] = min(covered[ch], job["end"])
+        else:
+            return
+        batch["last_successful"] = self._batch_success_date(batch)
+        self._save_batches()
+        self._refresh_batch_info()
 
     def _reset_buttons(self):
         self.pause_event.clear()
@@ -1539,9 +1592,18 @@ class ScraperApp:
             self._log(f"WARNING: could not save settings: {exc}")
 
     def _load_batches(self):
-        batches = persistence.load(BATCHES_FILE, _valid_batches, [], self._log)
-        for batch in batches:
+        loaded = persistence.load(BATCHES_FILE, lambda value: isinstance(value, list),
+                                  [], self._log)
+        batches = []
+        for entry in loaded:
+            batch = _repair_batch(entry)
+            if batch is None:
+                self._log("WARNING: one saved batch could not be read and was left out. "
+                          f"The file as it was is kept as {BATCHES_FILE.name}.rejected "
+                          "when batches are next saved.")
+                continue
             batch.setdefault("id", uuid.uuid4().hex)
+            batches.append(batch)
         return batches
 
     def _save_batches(self):

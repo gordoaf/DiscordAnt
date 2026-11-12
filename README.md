@@ -110,9 +110,12 @@ A batch is a named set of channels, for the ones you come back to. **New...**
 makes one: give it a name and paste the channel links. After that, pick the
 batch and press **Queue batch** to get one job per channel.
 
-Picking a batch fills in the end date from successfully collected history,
-using the oldest completed date across its channels. Failed or pending jobs
-never advance it. If the end date is blank the app
+Picking a batch fills in the end date with the day the batch is collected
+through, so the default is "everything since last time". Only jobs that
+finished count, and the channel that is furthest behind decides, so a failed
+or waiting job never moves the date. A batch that was last run by version
+1.0.0 offers the day it was last queued until its first run here finishes.
+If the end date is blank the app
 asks first, because that means every channel back to its beginning. Tick
 **Batches into a dated subfolder** and each run gets its own folder.
 
@@ -161,7 +164,10 @@ A job that fails does not stop the queue: it is marked `failed` and the next
 one starts. **Clear finished** removes only successful jobs; failed and
 unfinished jobs stay visible. The queue is saved and comes back the next time
 you open the app. Settings, batches and the queue use atomic writes and a
-last-good `.bak` file; recovery problems appear in the log.
+last-good `.bak` file; recovery problems appear in the log. A saved file the
+app cannot read is never thrown away: it is kept beside the new one with
+`.rejected` on the end. One odd value in the batches file costs that batch or
+channel at most, not the whole list.
 
 **Keep PC awake** stops the PC going to sleep while the queue runs (closing a
 laptop lid still suspends it). **Per-job limit** stops a job after that many
@@ -184,36 +190,54 @@ page belongs to the requested person, server and date range. If the app
 cannot verify that, it stops with a useful note rather than claiming the
 range is complete. An unknown person with no results needs a verifiable
 profile suggestion or an identity already learned from a channel collection.
+If the results move while they are being paged (the person posts, or a
+message is deleted), the pages already read are kept and the search carries
+on from there.
 
-Discord's search index can lag. User jobs leave the newest 15 minutes pending
-and show an `incomplete` status until a later run collects them. Their JSON
-contains completeness fields including `complete`, `deferred_recent`,
-`searched_through`, `search_cutoff` and `requested_through`. The transcript
-shows the same collection note. **Start over** reloads full messages and
-conversation context, including edits; an interrupted refresh resumes later.
+Discord's search runs about 15 minutes behind. A user job "up to now"
+collects everything the search can see and is then `done`; the newest few
+minutes are picked up the next time it runs. Its JSON says exactly how far it
+got, in `complete`, `deferred_recent`, `searched_through`, `search_cutoff`
+and `requested_through`, and the transcript says the same in words. Only a
+job whose dates are entirely inside those last minutes stays `incomplete`.
+
+The conversation around a message counts as loaded when eight messages on
+each side are held, or fewer where the channel begins or ends there. A
+message that has been deleted since it was found is not asked for again.
+**Start over** reloads full messages and conversation context, including
+edits; an interrupted refresh resumes later.
 
 ### Updating an older archive
 
-Version 1.0.1 preserves existing messages, pictures and old index evidence.
-It rebuilds image references and stops trusting completion markers from
-1.0.0, because those markers could hide gaps. The next jobs may therefore
-recheck previously collected history once. This does not delete your archive
-or your old export files.
+Updating keeps your messages, your pictures and the record of what has
+already been read, so nothing you have is collected again. Picture
+references are rebuilt once (each now belongs to one message); a saved
+picture stays listed wherever it is still certainly the right one. Old
+"conversation loaded" marks from 1.0.0 are not relied on, so a user job that
+is run again may revisit a few messages once.
+
+Version 1.0.1 set the record of what had been read aside when it updated an
+archive. If yours went through 1.0.1, this version puts that record back the
+first time it opens the archive.
 
 ### Output files
 
 Automatic names include the full server/channel IDs. Existing files receive
 a different unused name. An explicitly chosen existing file needs your
 approval, and a file changed by another program during collection is left
-alone. Every queued job reserves its JSON and, for user jobs, its Markdown
-transcript, including while stopped or incomplete. Only one Windows app
+alone. Every job that still has work to do reserves its JSON and, for user
+jobs, its Markdown transcript, including while stopped or incomplete; a job
+that is done or failed no longer holds its file. Only one Windows app
 instance can run at a time.
 
-Pictures are limited to supported raster formats, 20 MiB per download and
-100 MiB per job. Image downloads use a separate HTTPS connection to allowed
-Discord CDN hosts, with no login, cookies, redirects or web-page rendering.
-Unsupported or failed downloads are skipped and the first failures are
-reported in the log; a saved preview remains available when full-size fails.
+Pictures the browser shows while it scrolls are saved from the browser's own
+copy, so they cost Discord nothing extra. The optional full-size pass at the
+end of a job fetches each picture once more at full size, over a separate
+HTTPS connection to Discord's picture servers with no login, cookies,
+redirects or web-page rendering; it is limited to 20 MiB per picture and
+100 MiB per job. Only common picture formats are kept. Unsupported or failed
+downloads are skipped and the first failures are reported in the log; the
+saved preview stays when full size fails.
 
 ## What the files look like
 
@@ -324,7 +348,7 @@ and the bundled-browser self-test, then publishes the installer, `SHA256SUMS`
 and `provenance.json`. Compare the installer's hash before running it:
 
 ```
-Get-FileHash .\DiscordAnt-Setup-1.0.1.exe -Algorithm SHA256
+Get-FileHash .\DiscordAnt-Setup-1.0.2.exe -Algorithm SHA256
 ```
 
 Provenance records the source commit, dependency lock hashes, Python version,

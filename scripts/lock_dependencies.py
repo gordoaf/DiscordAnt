@@ -74,8 +74,7 @@ def wheel_hashes(directory, expected):
         name = canonicalize_name(name)
         if name not in expected or str(version) != expected[name]:
             raise ValueError("Downloaded an unexpected wheel")
-        with path.open("rb") as handle:
-            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
         hashes.setdefault(name, set()).add(digest)
     if set(hashes) != set(expected):
         raise ValueError("Missing binary wheel for a locked dependency")

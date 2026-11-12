@@ -308,12 +308,7 @@ async def _search_pass(ses, store, guild_id, name, lo, hi, log):
             raise SearchProblem("Search did not report a valid result count.")
         if total < 0:
             raise SearchProblem("Search reported an invalid result count.")
-        if expected_total is not None and total != expected_total:
-            raise SearchProblem("Search results changed while paging; retry this range before claiming coverage.")
-        expected_total = total
         hits = entry["hits"]
-        out["hits"] += len(hits)
-        out["pages"] += 1
         wrong = [h for h in hits if str(h.get("author_id")) != str(author_id)]
         if wrong:
             raise SearchProblem("The search returned other people's messages — "
@@ -323,10 +318,23 @@ async def _search_pass(ses, store, guild_id, name, lo, hi, log):
         except (TypeError, ValueError, KeyError):
             raise SearchProblem("Search returned an invalid message ID.")
         if (ids != sorted(ids, reverse=True) or len(set(ids)) != len(ids)
-                or seen_ids.intersection(ids)
-                or (previous_low is not None and ids and max(ids) >= previous_low)
                 or any(i <= qmin or (qmax is not None and i >= qmax) for i in ids)):
-            raise SearchProblem("Search pages were repeated or not in newest-first order; coverage was not recorded.")
+            raise SearchProblem("A search page was not in newest-first order or left "
+                                "the requested range; coverage was not recorded.")
+        # The results can move while they are being paged: the person posts,
+        # or a message is deleted, and every later page shifts by one. The
+        # pages read before that are still good. Keep them, drop this page,
+        # and let the caller search again from where the good pages ended.
+        if ((expected_total is not None and total != expected_total)
+                or seen_ids.intersection(ids)
+                or (previous_low is not None and ids and max(ids) >= previous_low)):
+            log("The search results moved while paging (a new or deleted "
+                "message). Searching again from the last good page.")
+            out["cut_short"] = True
+            break
+        expected_total = total
+        out["hits"] += len(hits)
+        out["pages"] += 1
         seen_ids.update(ids)
         if ids:
             low = min(ids)
@@ -336,13 +344,15 @@ async def _search_pass(ses, store, guild_id, name, lo, hi, log):
             log(f"Search found {total} message(s) in this stretch"
                 + (" (Discord is still indexing old messages, so this may be "
                    "incomplete)" if deep else "") + ".")
-        if not hits and offset < total:
-            raise SearchProblem("Search returned an empty page before all results were loaded.")
         if offset + len(hits) >= total:
             reached_end = True
             break
         if len(hits) != SEARCH_PAGE:
-            raise SearchProblem("Search returned a short page before all results were loaded.")
+            # Fewer results than Discord's own count promised. What came is
+            # kept; the rest of the stretch is searched again by the caller
+            # and stays marked as not searched until a search covers it.
+            out["cut_short"] = True
+            break
         if oldest is not None and oldest < lo:
             break                        # paged past everything we came for
         if pacer.stopped or pacer.out_of_time():
@@ -413,16 +423,20 @@ def _context_proof(fetch, ch, mid, k, triggered=None):
         target = int(q.get("around") or -1)
     except (TypeError, ValueError):
         return None
-    if str(fetch.get("channel")) != str(ch) or target != int(mid) or int(mid) not in ids:
+    if str(fetch.get("channel")) != str(ch) or target != int(mid):
         return None
+    # The answer to "around this message" is used even when the message itself
+    # is missing from it: it was deleted since it was found, and what Discord
+    # sent is everything that still surrounds that spot.
     before = sum(i < int(mid) for i in ids)
     after = sum(i > int(mid) for i in ids)
-    # Boundary flags must come from a captured endpoint response. A short
-    # page is not inferred here from a handful of cached search hits.
+    # The channel-edge flags come from the captured answer itself (see
+    # Session._take_batch), never from a handful of cached search hits.
     at_start = bool(fetch.get("at_start"))
     at_end = bool(fetch.get("at_end"))
     return {"before": before, "after": after, "at_start": at_start,
-            "at_end": at_end, "complete": (before >= k or at_start) and (after >= k or at_end)}
+            "at_end": at_end, "gone": int(mid) not in ids,
+            "complete": (before >= k or at_start) and (after >= k or at_end)}
 
 
 async def _wait_fetch(ses, ch, mid, n0, timeout, k=CONTEXT_K, triggered=None):
@@ -587,8 +601,15 @@ def export_user(store, guild_id, author_id, lo, hi, out_path, log,
     if note:
         md += [f"**Note:** {_md_inline(note)}", ""]
     if completeness is not None:
-        md += [f"Complete: {'yes' if completeness.get('complete') else 'no'}. "
-               f"Searched through: {_md_inline(completeness.get('searched_through') or 'not yet verified')}. ", ""]
+        through = completeness.get("searched_through")
+        if completeness.get("complete"):
+            md += ["Complete for these dates.", ""]
+        elif completeness.get("deferred_recent") and through:
+            md += [f"Complete up to {_md_inline(through)}. Newer messages are "
+                   f"collected by the next run.", ""]
+        else:
+            md += ["Not complete yet: run the job again to continue. Searched through: "
+                   f"{_md_inline(through or 'not yet verified')}.", ""]
     md += [f"Lines marked ▶ are {_md_inline(username)}'s. Unmarked lines are the conversation "
            f"around them. Times are UTC.", ""]
     for c in channels:
@@ -666,15 +687,27 @@ async def run_user_history(*, guild_id, channel_id, username, start_dt, end_dt,
 
     def finish(outcome, note=None, images=0):
         eligible_complete = not search_gaps()
-        if deferred:
-            tail_note = ("Recent messages are deferred while Discord's search index catches up. "
-                         "Search cutoff: " + sc.snowflake_to_dt(search_hi).isoformat()
-                         + ". Run this job again later to collect the pending tail.")
+        searched_any = search_hi >= win_lo
+        if deferred and not searched_any:
+            # The whole range is newer than Discord's search can see yet, so
+            # nothing was searched: the job has to come back later.
+            tail_note = ("These dates are too recent for Discord's search, which runs "
+                         "about 15 minutes behind. Run this job again later.")
             note = (note + "; " if note else "") + tail_note
             if outcome == sc.END_DATE:
                 outcome = sc.STALLED
+        elif deferred:
+            # A job "up to now" is finished once everything the search can see
+            # is collected. The last few minutes belong to the next run; the
+            # output says exactly where this one stopped.
+            tail_note = ("Searched up to "
+                         + sc.snowflake_to_dt(search_hi).strftime("%Y-%m-%d %H:%M UTC")
+                         + ". Discord's search runs about 15 minutes behind; anything "
+                         "newer is collected the next time this runs.")
+            note = (note + "; " if note else "") + tail_note
         metadata = {
             "complete": outcome == sc.END_DATE and not deferred,
+            "searched_any": searched_any,
             "deferred_recent": deferred,
             "searched_through": (sc.snowflake_to_dt(search_hi).isoformat()
                                  if eligible_complete and search_hi >= win_lo else None),
@@ -816,6 +849,7 @@ async def run_user_history(*, guild_id, channel_id, username, start_dt, end_dt,
             await collect(ses)
     except sc.PacerInterrupted as exc:
         outcome = exc.outcome
-    if not author_id and note is None and outcome not in (sc.STOPPED, sc.BUDGET) and not deferred:
+    if (not author_id and note is None and outcome not in (sc.STOPPED, sc.BUDGET)
+            and search_hi >= win_lo):
         note = f"no user called '{name}' was found"
     return finish(outcome or pacer.outcome() or sc.STALLED, note, images)

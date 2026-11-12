@@ -13,8 +13,10 @@ On top of that:
     scraped before is not scraped again.
   - Pause / resume (the browser stays open while paused).
   - Channel and server names are read off the page.
-  - Supported raster images are saved through an isolated, bounded HTTPS
-    downloader. It carries no Discord login and never renders web content.
+  - Pictures the browser loads while scrolling are kept from the browser's own
+    copy (no extra request). The optional full-size pass afterwards uses a
+    separate, bounded HTTPS downloader that carries no Discord login and
+    never renders web content.
   - Mentions, reactions, stickers, forwarded messages and polls are kept.
 
 The output file for a job is always the complete requested range, written
@@ -742,7 +744,6 @@ class Session:
         self._handler_errors = 0
         self._response_tasks = set()
         self._request_starts = weakref.WeakKeyDictionary()
-        self._image_slots = asyncio.Semaphore(2)
         self._download_lock = asyncio.Lock()
         self._image_bytes = 0
         self._image_failures = 0
@@ -920,12 +921,25 @@ class Session:
         if lo is not None and hi is not None and hi >= lo:
             self.store.add_coverage(channel_id, lo, hi)
         target = next((int(q[k][0]) for k in ("before", "after", "around") if k in q), None)
+        at_start = top
+        at_end = bool(ids) and (kind == "latest" or
+                                (kind == "around" and target in ids and ids[-1] == target))
+        if kind == "around" and ids and len(ids) < limit:
+            # Discord answers "around" with about half the page on each side.
+            # A page that came back short ran out of channel: the side that
+            # holds clearly less than its half ends at the channel's first or
+            # last message. (The same reading as "short page = beginning"
+            # above; used only for the conversation check, not for coverage.)
+            half = limit // 2
+            at_start = at_start or sum(1 for i in ids if i < target) < half - 1
+            at_end = at_end or sum(1 for i in ids if i > target) < half - 1
+        elif kind == "around" and not ids:
+            at_end = True                     # an empty channel has no later side
         self.fetches.append({"channel": channel_id, "kind": kind, "n": len(ids),
                              "min": ids[0] if ids else None,
                              "max": ids[-1] if ids else None,
-                              "new": new_ids, "top": top, "at_start": top,
-                              "at_end": bool(ids) and (kind == "latest" or
-                                  (kind == "around" and target in ids and ids[-1] == target)),
+                              "new": new_ids, "top": top, "at_start": at_start,
+                              "at_end": at_end,
                               "query": {k: v[0] for k, v in q.items()},
                               "request_started": request_started,
                               "request_target": {"kind": kind, "id": target},
@@ -964,9 +978,13 @@ class Session:
         self.searches.append(info)
 
     async def _take_image(self, resp):
+        """Keep the copy of a picture that the browser itself just loaded.
+
+        Nothing is requested here: the bytes are read from the browser's own
+        answer, so showing a picture costs Discord one request, not two."""
         ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
         parsed = _image_url(resp.url)
-        if ctype not in IMAGE_EXT or parsed is None or self._image_slots.locked():
+        if ctype not in IMAGE_EXT or parsed is None:
             return
         path = parsed.path
         m = ATTACH_PATH_RE.match(path)
@@ -981,12 +999,21 @@ class Session:
                 or not row.get("file") or not Path(row["file"]).is_file())]
         if not rows:
             return
-        async with self._image_slots:
-            image = await self._download_image(resp.url)
-            if image is not None:
-                body, ctype = image
-                for row in rows:
-                    self._save_image(row, body, ctype, full=False)
+        # The per-job download allowance is for pictures this app fetches by
+        # itself (the full-size pass). These bytes the browser already has.
+        declared = resp.headers.get("content-length") or ""
+        if declared.isdecimal() and int(declared) > MAX_IMAGE_BYTES:
+            return
+        try:
+            body = await self.pacer.run(resp.body(), timeout=30)
+        except PacerInterrupted:
+            raise
+        except Exception:
+            return                      # e.g. served from the browser's cache
+        if not body or len(body) > MAX_IMAGE_BYTES or self._closed:
+            return
+        for row in rows:
+            self._save_image(row, body, ctype, full=False)
 
     async def _download_image(self, url):
         """Download in a bounded, isolated transport; never render untrusted data."""

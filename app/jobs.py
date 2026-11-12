@@ -144,8 +144,10 @@ def outcome_status(job, res):
     outcome = res.get("outcome")
     if outcome == sc.STOPPED:
         return STOPPED, f"{count} messages so far"
+    # No such person is a failure - unless the dates were too recent for
+    # Discord's search to be tried at all, which is only "not yet".
     if (kind == USER_JOB and not res.get("author_id") and outcome != sc.BUDGET
-            and not res.get("deferred_recent")):
+            and res.get("searched_any", True)):
         return FAILED, (res.get("note")
                         or f"no user called '{job.get('username')}' was found")
     if outcome in (sc.END_DATE, sc.TOP):

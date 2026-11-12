@@ -18,8 +18,11 @@ LOCKS = ("requirements-win-py314.lock", "requirements-build-win-py314.lock")
 
 
 def sha256(path):
+    digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def app_version(root=ROOT):

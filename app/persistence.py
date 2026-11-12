@@ -48,7 +48,10 @@ def save(path, value, validate=None):
             if type(decoded) is not type(value) or (validate and not validate(decoded)):
                 raise ValueError("unexpected previous data structure")
         except (ValueError, UnicodeError):
-            previous = None
-        if previous is not None:
+            # Not something this version understands, so it must not replace
+            # the last-good backup - but it may be the only copy of what the
+            # user had, so it is set aside instead of being silently lost.
+            _replace(path.with_suffix(path.suffix + ".rejected"), previous)
+        else:
             _replace(path.with_suffix(path.suffix + ".bak"), previous)
     _replace(path, payload)

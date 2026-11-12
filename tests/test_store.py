@@ -203,6 +203,8 @@ class LegacyMigrationTests(unittest.TestCase):
                     bytes INTEGER DEFAULT 0,full INTEGER DEFAULT 0);
                 INSERT INTO messages VALUES('1',100,NULL,NULL,'invalid JSON');
                 INSERT INTO coverage VALUES('1',0,500);
+                INSERT INTO images(key,channel_id,message_id,kind)
+                    VALUES('a:900','1',100,'attachment');
             """)
             old.commit()
             old.close()
@@ -246,21 +248,137 @@ class LegacyMigrationTests(unittest.TestCase):
             store = Store(path)
             try:
                 self.assertEqual(store.count_in("1", 0, 500), 1)
-                self.assertEqual(store.coverage("1"), [])
-                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM coverage_legacy").fetchone()[0], 2)
+                # What 1.0.0 recorded as fully read is still recorded.
+                self.assertEqual(store.coverage("1"), [(0, 500)])
+                self.assertEqual(store.gaps("1", 0, 500), [])
+                self.assertFalse(store._has_table("coverage_legacy"))
                 self.assertFalse(store.context_marked("1", 100, 1))
                 self.assertEqual(store.db.execute("SELECT COUNT(*) FROM context_done").fetchone()[0], 1)
                 self.assertEqual(store.db.execute("SELECT COUNT(*) FROM images_legacy").fetchone()[0], 1)
                 self.assertEqual(len(store.images_by_attachment("900")), 2)
                 self.assertTrue(all(r["file"] == str(saved) for r in store.images_by_attachment("900")))
-                store.add_coverage("1", 0, 100)
+                store.add_coverage("1", 400, 600)
             finally:
                 store.close()
             store = Store(path)
             try:
-                self.assertEqual(store.coverage("1"), [(0, 100)])
+                self.assertEqual(store.coverage("1"), [(0, 600)])
                 self.assertEqual(saved.read_bytes(), b"preserve this old image")
                 self.assertEqual(store.db.execute("SELECT COUNT(*) FROM images_legacy").fetchone()[0], 1)
+            finally:
+                store.close()
+
+    def test_new_archive_needs_no_legacy_tables(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td) / "new.db")
+            try:
+                self.assertEqual(store._meta("proof_version"), "3")
+                self.assertEqual(store._meta("image_version"), "3")
+                self.assertFalse(store._has_table("coverage_legacy"))
+                self.assertFalse(store._has_table("images_legacy"))
+            finally:
+                store.close()
+
+    def as_left_by_1_0_1(self, path, legacy, current):
+        """An archive in the state 1.0.1 put it in: the record of what was
+        read set aside in coverage_legacy, plus whatever was read afterwards."""
+        store = Store(path)
+        store.put_messages("1", [rec(100)])
+        store.db.execute("CREATE TABLE coverage_legacy AS SELECT * FROM coverage")
+        store.db.executemany("INSERT INTO coverage_legacy(channel_id,lo,hi) VALUES(?,?,?)", legacy)
+        store.db.execute("DELETE FROM coverage")
+        store.db.executemany("INSERT INTO coverage(channel_id,lo,hi) VALUES(?,?,?)", current)
+        store.db.execute("UPDATE archive_meta SET value='2'")
+        store.close()
+
+    def test_archive_upgraded_by_1_0_1_gets_its_record_back_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "was-101.db"
+            self.as_left_by_1_0_1(
+                path,
+                legacy=[("1", 0, 500), ("1", 900, 950), ("2", 10, 20), ("user:1:99", 0, 500)],
+                current=[("1", 450, 700), ("user:v2:1:99", 5, 6)])
+            store = Store(path)
+            try:
+                self.assertEqual(store.coverage("1"), [(0, 700), (900, 950)])
+                self.assertEqual(store.coverage("2"), [(10, 20)])
+                self.assertEqual(store.coverage("user:1:99"), [])       # old search records stay aside
+                self.assertEqual(store.coverage("user:v2:1:99"), [(5, 6)])
+                self.assertEqual(store._meta("proof_version"), "3")
+                store.clear_coverage("1", 0, 100)                       # a later "Start over"
+            finally:
+                store.close()
+            store = Store(path)
+            try:
+                self.assertEqual(store.coverage("1"), [(101, 700), (900, 950)])   # not put back twice
+            finally:
+                store.close()
+
+    def old_archive_with_embed(self, path, saved, edited=False, legacy_match=None):
+        link = "https://images-ext-1.discordapp.net/external/SIG/https/example.com/pic.png"
+        message = embed(link, mid=100)
+        if edited:
+            message["edited"] = True
+        old = sqlite3.connect(path)
+        old.executescript("""
+            CREATE TABLE messages(channel_id TEXT,id INTEGER,ts TEXT,author_id TEXT,rec TEXT,
+                                  PRIMARY KEY(channel_id,id)) WITHOUT ROWID;
+            CREATE TABLE coverage(channel_id TEXT,lo INTEGER,hi INTEGER);
+            CREATE TABLE images(key TEXT PRIMARY KEY,channel_id TEXT,message_id INTEGER,
+                kind TEXT,name TEXT,match TEXT,url TEXT,file TEXT,w INTEGER,h INTEGER,
+                bytes INTEGER DEFAULT 0,full INTEGER DEFAULT 0);
+        """)
+        old.execute("INSERT INTO messages VALUES(?,?,?,?,?)",
+                    ("1", 100, message["ts"], "99", json.dumps(message)))
+        old.execute("INSERT INTO images VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("e:100:0", "1", 100, "embed", "pic.png",
+                     legacy_match or "/external/SIG/https/example.com/pic.png", link,
+                     str(saved), None, None, 7, 1))
+        old.commit()
+        old.close()
+
+    def test_saved_embed_picture_stays_listed_when_it_is_still_the_right_one(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = Path(td) / "pic.png"
+            saved.write_bytes(b"picture")
+            cases = (("kept", {}, str(saved)),
+                     ("edited message", {"edited": True}, None),
+                     ("different link", {"legacy_match": "/external/OTHER/pic.png"}, None))
+            for label, options, expected in cases:
+                with self.subTest(label):
+                    path = Path(td) / (label.replace(" ", "-") + ".db")
+                    self.old_archive_with_embed(path, saved, **options)
+                    store = Store(path)
+                    try:
+                        row = store.images_for("1", 100)[0]
+                        self.assertEqual(row["file"], expected)
+                        self.assertEqual(row["full"], 1 if expected else 0)
+                    finally:
+                        store.close()
+            # the file gone from disk: not listed
+            path = Path(td) / "missing.db"
+            self.old_archive_with_embed(path, Path(td) / "nowhere.png")
+            store = Store(path)
+            try:
+                self.assertIsNone(store.images_for("1", 100)[0]["file"])
+            finally:
+                store.close()
+            self.assertEqual(saved.read_bytes(), b"picture")
+
+    def test_embed_picture_unlisted_by_1_0_1_is_listed_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            saved = Path(td) / "pic.png"
+            saved.write_bytes(b"picture")
+            path = Path(td) / "was-101.db"
+            self.old_archive_with_embed(path, saved)
+            store = Store(path)
+            # put it in the state 1.0.1 left: listing dropped, versions at 2
+            store.db.execute("UPDATE images SET file=NULL,bytes=0,full=0")
+            store.db.execute("UPDATE archive_meta SET value='2'")
+            store.close()
+            store = Store(path)
+            try:
+                self.assertEqual(store.images_for("1", 100)[0]["file"], str(saved))
             finally:
                 store.close()
 

@@ -155,12 +155,132 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(job["out"], before)
         self.assertTrue(all(p.exists() for p in jobs.output_paths(job)))
 
-    def test_deferred_unknown_user_job_is_resumable(self):
+    def test_dates_too_recent_to_search_stay_resumable_but_unknown_user_fails(self):
         status, note = jobs.outcome_status(self.job(kind=jobs.USER_JOB),
             {"outcome": gui.scraper_core.STALLED, "deferred_recent": True,
-             "author_id": None, "note": "Indexing pending"})
+             "searched_any": False, "author_id": None, "note": "Indexing pending"})
         self.assertEqual(status, jobs.INCOMPLETE)
         self.assertIn("Indexing pending", note)
+        # A search that did run and found no such person is a failure, also
+        # for a job "up to now" (which always leaves its last minutes for later).
+        status, note = jobs.outcome_status(self.job(kind=jobs.USER_JOB),
+            {"outcome": gui.scraper_core.STALLED, "deferred_recent": True,
+             "searched_any": True, "author_id": None, "note": "No user called 'x'"})
+        self.assertEqual(status, jobs.FAILED)
+        self.assertIn("No user", note)
+
+    def test_job_up_to_now_is_done(self):
+        status, _note = jobs.outcome_status(self.job(kind=jobs.USER_JOB),
+            {"outcome": gui.scraper_core.END_DATE, "deferred_recent": True,
+             "searched_any": True, "author_id": "30", "count": 3, "channels": 1})
+        self.assertEqual(status, jobs.DONE)
+
+    def batch_app(self, batch):
+        self.app.batches = [batch]
+        self.app._current_batch = lambda: batch
+        self.app._label_for = lambda g, c, label: (label or "chan", False)
+        self.app.out_var, self.app.dated_var = Var(str(self.folder)), Var(False)
+        self.prompt.return_value = True
+
+    def finish_all(self, day):
+        for job in list(self.app.jobs):
+            job["status"] = jobs.DONE
+            self.app._record_batch_success(dict(job), datetime(2026, 11, day, tzinfo=timezone.utc))
+        self.app.jobs.clear()
+
+    def test_batch_from_an_older_version_still_offers_since_last_time(self):
+        batch = {"name": "old", "last_queued": "2026-11-09", "channels": [
+            {"guild_id": "11", "channel_id": "22", "label": "a"},
+            {"guild_id": "11", "channel_id": "33", "label": "b"}]}
+        self.batch_app(batch)
+        self.assertEqual(self.app._batch_since(batch), ("2026-11-09", "last queued"))
+        self.app.start_var, self.app.end_var = Var(""), Var("2026-11-09")
+        self.app._queue_batch()
+        self.finish_all(12)
+        self.assertEqual(self.app._batch_since(batch), ("2026-11-12", "collected through"))
+
+    def test_one_mistaken_blank_end_date_does_not_stick(self):
+        batch = {"name": "b", "channels": [{"guild_id": "11", "channel_id": "22", "label": "a"}]}
+        self.batch_app(batch)
+        self.app.start_var, self.app.end_var = Var(""), Var("")
+        self.app._queue_batch()                 # blank End, confirmed...
+        self.app.jobs.clear()                   # ...then removed without running
+        offered = []
+        for end, day in (("2026-11-01", 5), ("2026-11-05", 8), ("2026-11-08", 11)):
+            self.app.start_var, self.app.end_var = Var(""), Var(end)
+            self.app._queue_batch()
+            self.finish_all(day)
+            offered.append(self.app._batch_success_date(batch))
+        self.assertEqual(offered, ["2026-11-05", "2026-11-08", "2026-11-11"])
+
+    def test_failed_channel_holds_the_batch_date_back(self):
+        batch = {"name": "b", "channels": [
+            {"guild_id": "11", "channel_id": "22", "label": "a"},
+            {"guild_id": "11", "channel_id": "33", "label": "b"}]}
+        self.batch_app(batch)
+        self.app.start_var, self.app.end_var = Var(""), Var("2026-11-01")
+        self.app._queue_batch()
+        self.finish_all(5)
+        self.app.end_var = Var("2026-11-05")
+        self.app._queue_batch()
+        failed = next(j for j in self.app.jobs if j["channel_id"] == "33")
+        self.app.jobs.remove(failed)            # channel 33 did not finish this time
+        self.finish_all(9)
+        self.assertEqual(self.app._batch_success_date(batch), "2026-11-05")
+        self.assertEqual(batch["completed"], {"22": "2026-11-09", "33": "2026-11-05"})
+
+    def test_older_or_newer_separate_range_does_not_move_the_date(self):
+        batch = {"id": "b1", "name": "b", "channels": [{"guild_id": "11", "channel_id": "22"}],
+                 "completed": {"22": "2026-11-05"}, "covered_from": {"22": "2026-11-01"}}
+        self.app.batches = [batch]
+        when = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        older = self.job()
+        older.update(batch_id="b1", end="2026-01-01", start="2026-03-01")
+        self.app._record_batch_success(older, when)
+        newer = self.job()
+        newer.update(batch_id="b1", end="2026-11-10", start="")
+        self.app._record_batch_success(newer, when)
+        self.assertEqual(batch["completed"], {"22": "2026-11-05"})
+        joined = self.job()
+        joined.update(batch_id="b1", end="2026-11-05", start="")
+        self.app._record_batch_success(joined, when)
+        self.assertEqual(batch["completed"], {"22": "2026-11-20"})
+        self.assertEqual(batch["covered_from"], {"22": "2026-11-01"})
+
+    def test_finished_job_does_not_hold_its_file(self):
+        done, waiting = self.job(status=jobs.DONE), self.job(status=jobs.PENDING)
+        failed = self.job(status=jobs.FAILED)
+        self.app.jobs = [done, failed, waiting]
+        self.app._check_free(waiting["out"], kind=waiting["type"], ignore=waiting)
+        self.app.jobs.append(self.job(status=jobs.STOPPED))
+        with self.assertRaises(ValueError):
+            self.app._check_free(waiting["out"], kind=waiting["type"], ignore=waiting)
+
+    def test_one_odd_value_does_not_cost_the_saved_batches(self):
+        path = self.folder / "batches.json"
+        original = [
+            {"name": "keep me", "last_queued": "2026-11-09", "channels": [
+                {"guild_id": 11, "channel_id": "22", "label": None},
+                {"guild_id": "x", "channel_id": "33", "label": "unusable"}]},
+            {"name": "and me", "completed": "not a mapping",
+             "channels": [{"guild_id": "11", "channel_id": "33", "label": "x"}]},
+            {"no": "name"}]
+        path.write_text(json.dumps(original), encoding="utf-8")
+        real_save = gui.ScraperApp._save_batches
+        with patch.object(gui, "BATCHES_FILE", path):
+            loaded = self.app._load_batches()
+            self.assertEqual([b["name"] for b in loaded], ["keep me", "and me"])
+            self.assertEqual(loaded[0]["channels"],
+                             [{"guild_id": "11", "channel_id": "22", "label": ""}])
+            self.assertEqual(loaded[0]["last_queued"], "2026-11-09")
+            self.assertNotIn("completed", loaded[1])
+            self.assertTrue(any("could not be read" in line for line in self.app.logs))
+            self.app.batches = loaded
+            real_save(self.app)
+        self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))), 2)
+        # The file exactly as it was is set aside, not lost.
+        self.assertEqual(json.loads((self.folder / "batches.json.rejected").read_text(encoding="utf-8")),
+                         original)
 
     def test_invalid_queue_entries_do_not_crash_loader(self):
         for value in (None, [], 1, {"guild_id": "1", "channel_id": "2", "out": 42},
@@ -203,6 +323,9 @@ class PersistenceTests(unittest.TestCase):
         persistence.save(self.path, {"value": 3})
         self.assertEqual(json.loads(self.path.with_suffix(".json.bak").read_text()),
                          {"value": 1})
+        # ...and what could not be understood is set aside rather than lost.
+        self.assertEqual(self.path.with_suffix(".json.rejected").read_text(), "null")
+        self.assertEqual(json.loads(self.path.read_text()), {"value": 3})
 
     def test_export_guard_preserves_file_changed_during_collection(self):
         self.path.write_text("original", encoding="utf-8")

@@ -144,11 +144,29 @@ class Store:
             self.db.close()
             raise
 
-    def _migrate(self):
-        """Retain legacy evidence; rebuild only indexes whose proofs were unsafe.
+    def _meta(self, key):
+        row = self.db.execute("SELECT value FROM archive_meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
 
-        One atomic, version-gated migration never removes messages or files.
-        Images are streamed from records rather than loading an archive into RAM.
+    def _set_meta(self, key, value):
+        self.db.execute("INSERT INTO archive_meta(key,value) VALUES(?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def _has_table(self, name):
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                               (name,)).fetchone() is not None
+
+    def _migrate(self):
+        """Bring an older archive up to date in one all-or-nothing step.
+
+        Messages and picture files are never removed, and neither is the
+        record of which stretches of a channel were read in full: that record
+        is made the same way in every version, so an archive from 1.0.0 keeps
+        it. (1.0.1 emptied it on upgrade; it is put back here.)
+
+        Picture references are rebuilt once so that each belongs to exactly
+        one message. Older "conversation loaded" marks (context_done) are kept
+        but no longer relied on. Records are streamed, not loaded into memory.
         """
         with self.lock:
             self.db.execute("BEGIN IMMEDIATE")
@@ -158,30 +176,67 @@ class Store:
                     self.db.execute("ALTER TABLE images ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
                 if "identity" not in columns:
                     self.db.execute("ALTER TABLE images ADD COLUMN identity TEXT")
-                version = self.db.execute(
-                    "SELECT value FROM archive_meta WHERE key='proof_version'").fetchone()
-                if not version:
-                    self.db.execute("CREATE TABLE IF NOT EXISTS coverage_legacy AS SELECT * FROM coverage")
-                    self.db.execute("DELETE FROM coverage")
-                    # context_done is intentionally retained, but never trusted.
-                    self.db.execute("INSERT INTO archive_meta(key,value) VALUES('proof_version','2')")
-                version = self.db.execute(
-                    "SELECT value FROM archive_meta WHERE key='image_version'").fetchone()
-                if not version:
-                    self.db.execute("CREATE TABLE IF NOT EXISTS images_legacy AS SELECT * FROM images")
-                    self.db.execute("DELETE FROM images")
-                    cursor = self.db.execute("SELECT channel_id,rec FROM messages")
-                    while True:
-                        batch = cursor.fetchmany(200)
-                        if not batch:
-                            break
-                        for channel_id, raw in batch:
-                            self._index_images(channel_id, json.loads(raw), migrating=True)
-                    self.db.execute("INSERT INTO archive_meta(key,value) VALUES('image_version','2')")
+
+                proof = self._meta("proof_version")
+                if proof != "3":
+                    if proof == "2" and self._has_table("coverage_legacy"):
+                        # An archive that 1.0.1 upgraded: return what it set
+                        # aside, merged with anything read since. Old search
+                        # records ("user:...") stay aside; searches use new keys.
+                        legacy = self.db.execute(
+                            "SELECT channel_id,lo,hi FROM coverage_legacy "
+                            "WHERE channel_id NOT LIKE 'user:%'").fetchall()
+                        for channel_id, lo, hi in legacy:
+                            if lo is not None and hi is not None and int(hi) >= int(lo):
+                                self._merge_coverage(channel_id, int(lo), int(hi))
+                    self._set_meta("proof_version", "3")
+
+                images = self._meta("image_version")
+                if images != "3":
+                    if images is None and self.db.execute(
+                            "SELECT 1 FROM images LIMIT 1").fetchone():
+                        # From 1.0.0: one reference per picture -> one per message.
+                        self.db.execute(
+                            "CREATE TABLE IF NOT EXISTS images_legacy AS SELECT * FROM images")
+                        self.db.execute("DELETE FROM images")
+                        cursor = self.db.execute("SELECT channel_id,rec FROM messages")
+                        while True:
+                            batch = cursor.fetchmany(200)
+                            if not batch:
+                                break
+                            for channel_id, raw in batch:
+                                self._index_images(channel_id, json.loads(raw), migrating=True)
+                    elif images == "2" and self._has_table("images_legacy"):
+                        # From 1.0.1, which dropped every saved embed picture
+                        # from the listing: relist the ones that are still right.
+                        rows = self.db.execute(
+                            "SELECT key,channel_id,message_id,match FROM images "
+                            "WHERE kind='embed' AND file IS NULL").fetchall()
+                        for key, channel_id, mid, match in rows:
+                            rec = self.get(channel_id, mid) or {}
+                            self._restore_legacy_embed(key, channel_id, mid,
+                                                       key.rsplit(":", 1)[-1], match,
+                                                       bool(rec.get("edited")))
+                    self._set_meta("image_version", "3")
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
+
+    def _restore_legacy_embed(self, key, channel_id, mid, slot, match, edited):
+        """Relist a picture saved by 1.0.0 for an embed, when it is still the
+        right one: same message, same position, same link, the message was
+        never edited (an edit can swap what a position shows) and the file is
+        still there. Anything else is left to be fetched again."""
+        if edited:
+            return
+        saved = self.db.execute(
+            "SELECT file,bytes,full FROM images_legacy WHERE key=? AND channel_id=? "
+            "AND kind='embed' AND match IS ? AND file IS NOT NULL",
+            (f"e:{int(mid)}:{slot}", channel_id, match)).fetchone()
+        if saved and Path(saved[0]).is_file():
+            self.db.execute("UPDATE images SET file=?,bytes=?,full=? WHERE key=?",
+                            (*saved, key))
 
     def close(self):
         with self.lock:
@@ -291,21 +346,25 @@ class Store:
         if hi < lo:
             return
         with self.lock:
-            rows = self.db.execute(
-                "SELECT rowid, lo, hi FROM coverage WHERE channel_id=? "
-                "AND lo<=? AND hi>=?", (channel_id, hi + 1, lo - 1)).fetchall()
-            for _rowid, l, h in rows:
-                lo, hi = min(lo, l), max(hi, h)
             self.db.execute("BEGIN")
             try:
-                for rowid, _l, _h in rows:
-                    self.db.execute("DELETE FROM coverage WHERE rowid=?", (rowid,))
-                self.db.execute("INSERT INTO coverage(channel_id,lo,hi) VALUES(?,?,?)",
-                                (channel_id, lo, hi))
+                self._merge_coverage(channel_id, lo, hi)
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
+
+    def _merge_coverage(self, channel_id, lo, hi):
+        """Add [lo, hi], joining it with stretches it touches. The caller holds
+        the lock and an open transaction."""
+        rows = self.db.execute(
+            "SELECT rowid, lo, hi FROM coverage WHERE channel_id=? "
+            "AND lo<=? AND hi>=?", (channel_id, hi + 1, lo - 1)).fetchall()
+        for rowid, l, h in rows:
+            lo, hi = min(lo, l), max(hi, h)
+            self.db.execute("DELETE FROM coverage WHERE rowid=?", (rowid,))
+        self.db.execute("INSERT INTO coverage(channel_id,lo,hi) VALUES(?,?,?)",
+                        (channel_id, lo, hi))
 
     def coverage(self, channel_id):
         with self.lock:
@@ -579,8 +638,8 @@ class Store:
                                att.get("proxy") or att.get("url"),
                                att.get("w"), att.get("h"), "attachment:" + str(att["id"]))
             if migrating:
-                # Attachment IDs identify immutable blobs. Legacy embed slots
-                # could already point at stale files, so those need re-fetching.
+                # An attachment id always means the same file, so a picture
+                # saved for it stays valid for every message that carries it.
                 saved = self.db.execute(
                     "SELECT file,bytes,full FROM images_legacy WHERE kind='attachment' "
                     "AND match=? AND file IS NOT NULL ORDER BY full DESC,bytes DESC LIMIT 1",
@@ -601,6 +660,9 @@ class Store:
             self._upsert_image(key, channel_id, mid, "embed", name[:80],
                                url_path(link), link, img.get("w"), img.get("h"),
                                image_identity(img.get("url") or link))
+            if migrating:
+                self._restore_legacy_embed(key, channel_id, mid, i, url_path(link),
+                                           bool(rec.get("edited")))
         # Reconcile current references only; historical files are left intact.
         rows = self.db.execute("SELECT key FROM images WHERE channel_id=? AND message_id=?",
                                (channel_id, mid)).fetchall()

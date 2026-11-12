@@ -149,8 +149,33 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["query"]["around"], "444")
         self.assertEqual(captured["request_target"], {"kind": "around", "id": 444})
         self.assertEqual((captured["coverage_lo"], captured["coverage_hi"]), (443, 445))
-        self.assertFalse(captured["at_start"])
-        self.assertFalse(captured["at_end"])
+        # Three messages where fifty were asked for: the channel ends on both sides.
+        self.assertTrue(captured["at_start"])
+        self.assertTrue(captured["at_end"])
+
+    async def around(self, target, ids, limit=30):
+        await self.ses._on_response(response(
+            f"https://discord.com/api/v9/channels/222/messages?limit={limit}&around={target}",
+            [message(str(i)) for i in ids]))
+        return self.ses.fetches[-1]
+
+    async def test_short_around_page_tells_which_side_ran_out_of_channel(self):
+        full = await self.around(1000, range(985, 1015))            # 15 + target + 14
+        self.assertEqual((full["at_start"], full["at_end"]), (False, False))
+        near_end = await self.around(2000, range(1985, 2003))       # only 2 newer exist
+        self.assertEqual((near_end["at_start"], near_end["at_end"]), (False, True))
+        near_start = await self.around(3000, range(2998, 3015))     # only 2 older exist
+        self.assertEqual((near_start["at_start"], near_start["at_end"]), (True, False))
+        last = await self.around(4000, range(3985, 4001))           # the newest message
+        self.assertEqual((last["at_start"], last["at_end"]), (False, True))
+        # Coverage is still only what the page itself holds.
+        self.assertEqual((near_start["coverage_lo"], near_start["coverage_hi"]), (2998, 3014))
+
+    async def test_deleted_target_still_reports_the_sides_of_its_spot(self):
+        ids = [i for i in range(4985, 5003) if i != 5000]
+        gone = await self.around(5000, ids)
+        self.assertEqual((gone["at_start"], gone["at_end"]), (False, True))
+        self.assertNotIn(5000, gone["ids"])
 
     async def test_non_get_search_is_ignored(self):
         r = response("https://discord.com/api/v9/guilds/111/messages/search", {})
@@ -242,14 +267,14 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         row = self.image()
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def delayed(_):
+        async def delayed():
             started.set()
             await release.wait()
-            return b"thumbnail", "image/png"
+            return b"thumbnail"
 
-        self.ses._download_image = delayed
         r = response(CDN_URL)
         r.headers = {"content-type": "image/png"}
+        r.body = delayed
         task = asyncio.create_task(self.ses._take_image(r))
         await started.wait()
         self.assertTrue(self.ses._save_image(row, b"larger full-size image", "image/png", True))
@@ -262,14 +287,44 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_forwarded_attachment_keeps_both_message_files(self):
         self.image("446")
         self.image("447")
-        self.ses._download_image = AsyncMock(return_value=(b"synthetic", "image/png"))
         r = response(CDN_URL)
         r.headers = {"content-type": "image/png"}
+        r.body = AsyncMock(return_value=b"synthetic")
         await self.ses._take_image(r)
         rows = self.db.images_by_attachment("777")
         self.assertEqual(len(rows), 2)
         self.assertEqual(len({r["file"] for r in rows}), 2)
         self.assertTrue(all(Path(r["file"]).read_bytes() == b"synthetic" for r in rows))
+
+    async def test_picture_seen_while_scrolling_is_kept_without_a_second_request(self):
+        row = self.image()
+        r = response(CDN_URL)
+        r.headers = {"content-type": "image/png"}
+        r.body = AsyncMock(return_value=b"what the browser already loaded")
+        self.ses._image_bytes = sc.MAX_SESSION_IMAGE_BYTES      # download allowance used up
+        with patch.object(sc, "_read_cdn_image") as network, \
+             patch.object(sc.http.client, "HTTPSConnection") as connection:
+            await self.ses._take_image(r)
+            network.assert_not_called()
+            connection.assert_not_called()
+        r.body.assert_awaited_once()
+        saved = self.db.image(row["key"])
+        self.assertEqual(Path(saved["file"]).read_bytes(), b"what the browser already loaded")
+        self.assertEqual(saved["full"], 0)
+
+    async def test_oversized_or_unreadable_browser_picture_is_skipped(self):
+        row = self.image()
+        big = response(CDN_URL)
+        big.headers = {"content-type": "image/png",
+                       "content-length": str(sc.MAX_IMAGE_BYTES + 1)}
+        big.body = AsyncMock(return_value=b"x")
+        await self.ses._take_image(big)
+        big.body.assert_not_awaited()
+        cached = response(CDN_URL)
+        cached.headers = {"content-type": "image/png"}
+        cached.body = AsyncMock(side_effect=RuntimeError("no body for a cached answer"))
+        await self.ses._take_image(cached)
+        self.assertIsNone(self.db.image(row["key"])["file"])
 
     def test_filename_traversal_and_invalid_channel_cannot_escape_images(self):
         row = self.image(name="../../escape.png")
