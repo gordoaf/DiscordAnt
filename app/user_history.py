@@ -9,8 +9,9 @@ How it works, all inside the same real browser window at human pace:
      channel of the server the account can see.
   2. CONVERSATIONS — for each message whose surroundings are not in the
      archive yet, jumps to it (as clicking "Jump" on a search result does), so
-     Discord loads the messages around it — including the full message being
-     replied to.
+     Discord loads the messages around it. What a message replied to is kept
+     as a short quote (author and the first few hundred characters); the
+     replied-to message itself is in the output only when it is close by.
   3. Writes a JSON file grouped by channel, and a readable .md transcript.
 
 Both steps remember their progress in the archive, so a stopped job carries on
@@ -655,17 +656,7 @@ async def run_user_history(*, guild_id, channel_id, username, start_dt, end_dt,
     known = store.user(author_id) if author_id else None
     if not known or (known[1] or "").lower() != name.lower():
         author_id = None
-    if fresh and author_id:
-        store.clear_coverage(user_key(guild_id, author_id), win_lo, win_hi)
-        log("Starting over: search results and full messages will be refreshed.")
     queued_refresh = set()
-
-    def search_gaps():
-        if search_hi < win_lo:
-            return []
-        if not author_id:
-            return [(win_lo, search_hi)]
-        return store.gaps(user_key(guild_id, author_id), win_lo, search_hi)
 
     def queue_refresh():
         if fresh and author_id:
@@ -674,6 +665,24 @@ async def run_user_history(*, guild_id, channel_id, username, start_dt, end_dt,
                 if target not in queued_refresh:
                     store.request_context_refresh(*target)
                     queued_refresh.add(target)
+
+    if fresh and author_id:
+        # Start over is asked for once (the queue has already used up its
+        # flag), so what it means is written into the archive before anything
+        # can be stopped: first every message of theirs already held is marked
+        # "read again in full", then the search record is cleared. A Stop, a
+        # time limit or a crash during the first search then loses nothing;
+        # the next ordinary run finds both and carries on.
+        queue_refresh()
+        store.clear_coverage(user_key(guild_id, author_id), win_lo, win_hi)
+        log("Starting over: search results and full messages will be refreshed.")
+
+    def search_gaps():
+        if search_hi < win_lo:
+            return []
+        if not author_id:
+            return [(win_lo, search_hi)]
+        return store.gaps(user_key(guild_id, author_id), win_lo, search_hi)
 
     def context_todo():
         if not author_id:

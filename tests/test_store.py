@@ -169,6 +169,15 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(self.store.mark_context("1", 20, 1, at_start=True, at_end=True))
         self.assertFalse(self.store.context_refresh_pending("1", 20))
 
+    def test_covered_below_finds_where_older_history_ends(self):
+        self.store.add_coverage("1", 10, 20)
+        self.store.add_coverage("1", 40, 50)
+        self.assertEqual(self.store.covered_below("1", 45), 20)
+        self.assertEqual(self.store.covered_below("1", 35), 20)
+        self.assertEqual(self.store.covered_below("1", 60), 50)
+        self.assertIsNone(self.store.covered_below("1", 20))
+        self.assertIsNone(self.store.covered_below("2", 99))
+
     def test_message_transaction_rollback(self):
         with self.assertRaises(ValueError):
             self.store.put_messages("1", [attachment(), rec("bad")])

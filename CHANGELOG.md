@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.3 — 2026-11-12
+
+- Start over on a user job is now recorded in the archive the moment the job
+  begins. Before, a job stopped (or cut off by its time limit, or a crash)
+  before its first search answered lost the "read everything again" part:
+  the next run kept the old text of edited messages and still said complete.
+- A picture that finishes loading before the message list that mentions it
+  has been read is no longer dropped; it waits for that list. This could lose
+  previews, mostly of pictures the browser already had.
+- A browser-loaded picture is only copied once its size is known to be within
+  the limit, also when the server does not declare a length, and at most four
+  are copied at a time.
+- A batch last run by 1.0.0 still offers the day it was last queued, but that
+  day is now checked against the archive: the log names every channel that
+  has nothing collected just before it, so a missed run is visible before a
+  top-up skips it.
+- Wording: what a message replied to is kept as a short quote, not as the
+  full message, and the README and help now say so.
+
+Known limit, with a workaround: if **Start over** was pressed on a channel
+job in 1.0.1 and the job was stopped before it finished, updating treats the
+rest of that range as already read (1.0.1 kept no note of the request, so it
+cannot be told apart from an ordinary unfinished job). Press **Start over**
+on that job again.
+
 ## 1.0.2 — 2026-11-12
 
 Fixes for problems introduced in 1.0.1. Nothing here changes how fast or how

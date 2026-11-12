@@ -338,6 +338,42 @@ class UserHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("new", self.store.get("20", 500)["content"])
         self.assertFalse(self.store.context_refresh_pending("20", 500))
 
+    async def test_start_over_stopped_during_its_first_search_still_refreshes_later(self):
+        self.seed_user()
+
+        async def stopped_search(*_):
+            raise sc.PacerInterrupted(sc.STOPPED)
+
+        base = [patch.object(sc, "Session", self.offline_session()), patch.object(sc, "Pacer", FakePacer),
+                patch.object(sc, "window_ids", lambda *_: (101, 1000)), patch.object(uh, "search_now", lambda: 1000)]
+        for p in base:
+            p.start()
+            self.addCleanup(p.stop)
+        with patch.object(uh, "_start_search", stopped_search):
+            result = await self.invoke(fresh=True)
+        self.assertEqual(sc.STOPPED, result["outcome"])
+        self.assertTrue(self.store.context_refresh_pending("20", 500))
+        # The app is closed and opened again. The queue used up its "fresh"
+        # flag when the job started, so only the archive remembers.
+        self.store.close()
+        self.store = Store(self.folder / "archive.db")
+        self.assertTrue(self.store.context_refresh_pending("20", 500))
+
+        async def changed_search(ses, *_):
+            ses._take_search("10", "https://discord.com/api/v10/guilds/10/messages/search?author_id=30&min_id=100&max_id=1001&sort_by=timestamp&sort_order=desc",
+                             200, dict(total_results=1, messages=[[raw_message(content="thin search")]]))
+            return ses.searches[-1]
+
+        with patch.object(uh, "_start_search", changed_search):
+            result = await self.invoke()
+        self.assertEqual(sc.END_DATE, result["outcome"])
+        self.assertTrue(result["complete"])
+        self.assertEqual("new", self.store.get("20", 500)["content"])
+        self.assertFalse(self.store.context_refresh_pending("20", 500))
+        exported = (self.folder / "out.json").read_text(encoding="utf-8")
+        self.assertIn('"content": "new"', exported)
+        self.assertNotIn('"content": "old"', exported)
+
     async def test_job_up_to_now_finishes_and_says_where_it_stopped(self):
         # The last minutes are newer than Discord's search can see. Everything
         # older is collected, so the job is done; the files say how far it got.

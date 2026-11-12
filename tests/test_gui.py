@@ -247,6 +247,42 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(batch["completed"], {"22": "2026-11-20"})
         self.assertEqual(batch["covered_from"], {"22": "2026-11-01"})
 
+    def test_last_queued_day_is_checked_against_the_archive(self):
+        day = "2026-11-09"
+
+        def at(text):
+            return gui.scraper_core.dt_to_snowflake(
+                datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc))
+
+        store = gui.Store(self.folder / "archive.db")
+        self.addCleanup(store.close)
+        store.add_coverage("22", at("2026-10-01"), at("2026-11-10"))      # reaches the day
+        store.add_coverage("33", at("2026-10-01"), at("2026-11-06"))      # stops three days short
+        batch = {"name": "old", "last_queued": day, "channels": [
+            {"guild_id": "11", "channel_id": c, "label": n}
+            for c, n in (("22", "busy"), ("33", "short"), ("44", "never"))]}
+        self.batch_app(batch)
+        self.app.store = store
+        self.assertEqual(self.app._legacy_gaps(batch, day),
+                         [("short", "2026-11-06"), ("never", None)])
+        self.assertEqual(self.app._legacy_gaps(batch, "not a date"), [])
+        # The date offered is still the one 1.0.0 offered; the gap is said out loud.
+        self.assertEqual(self.app._batch_since(batch), (day, "last queued"))
+        self.app.start_var, self.app.end_var = Var("x"), Var()
+        self.app._prefill_batch_dates()
+        self.assertEqual((self.app.start_var.get(), self.app.end_var.get()), ("", day))
+        note = next(line for line in self.app.logs if line.startswith("NOTE:"))
+        self.assertIn("short (since 2026-11-06)", note)
+        self.assertIn("never (nothing before)", note)
+        self.assertNotIn("busy", note)
+        # Once a run with this version has finished, its own record is used
+        # and the old day, with its warning, is no longer shown.
+        self.app.logs.clear()
+        batch["completed"] = {"22": "2026-11-12", "33": "2026-11-12", "44": "2026-11-12"}
+        self.app._prefill_batch_dates()
+        self.assertEqual(self.app.end_var.get(), "2026-11-12")
+        self.assertFalse(any(line.startswith("NOTE:") for line in self.app.logs))
+
     def test_finished_job_does_not_hold_its_file(self):
         done, waiting = self.job(status=jobs.DONE), self.job(status=jobs.PENDING)
         failed = self.job(status=jobs.FAILED)

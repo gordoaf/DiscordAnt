@@ -273,7 +273,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             return b"thumbnail"
 
         r = response(CDN_URL)
-        r.headers = {"content-type": "image/png"}
+        r.headers = {"content-type": "image/png", "content-length": "64"}
         r.body = delayed
         task = asyncio.create_task(self.ses._take_image(r))
         await started.wait()
@@ -288,7 +288,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         self.image("446")
         self.image("447")
         r = response(CDN_URL)
-        r.headers = {"content-type": "image/png"}
+        r.headers = {"content-type": "image/png", "content-length": "64"}
         r.body = AsyncMock(return_value=b"synthetic")
         await self.ses._take_image(r)
         rows = self.db.images_by_attachment("777")
@@ -299,7 +299,7 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_picture_seen_while_scrolling_is_kept_without_a_second_request(self):
         row = self.image()
         r = response(CDN_URL)
-        r.headers = {"content-type": "image/png"}
+        r.headers = {"content-type": "image/png", "content-length": "64"}
         r.body = AsyncMock(return_value=b"what the browser already loaded")
         self.ses._image_bytes = sc.MAX_SESSION_IMAGE_BYTES      # download allowance used up
         with patch.object(sc, "_read_cdn_image") as network, \
@@ -325,6 +325,140 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         cached.body = AsyncMock(side_effect=RuntimeError("no body for a cached answer"))
         await self.ses._take_image(cached)
         self.assertIsNone(self.db.image(row["key"])["file"])
+
+    def picture_message(self, mid="446"):
+        return message(mid, attachments=[dict(id="777", filename="image.png",
+                                              content_type="image/png", url=CDN_URL,
+                                              proxy_url=CDN_URL)])
+
+    def picture_response(self, body=b"preview bytes"):
+        r = response(CDN_URL)
+        r.headers = {"content-type": "image/png", "content-length": str(len(body))}
+        r.body = AsyncMock(return_value=body)
+        return r
+
+    def slow_listing(self, messages):
+        """A message list whose body is only handed over when released."""
+        release = asyncio.Event()
+
+        async def slow_json():
+            await release.wait()
+            return messages
+
+        listing = response("https://discord.com/api/v9/channels/222/messages?limit=50")
+        listing.json = slow_json
+        return listing, release
+
+    async def test_picture_that_arrives_before_its_message_list_is_still_saved(self):
+        # The browser already had the picture: it "loads" while the list of
+        # messages that mentions it is still being read.
+        listing, release = self.slow_listing([self.picture_message()])
+        reading = asyncio.create_task(self.ses._on_response(listing))
+        await asyncio.sleep(0.01)
+        picture = self.picture_response()
+        taking = asyncio.create_task(self.ses._on_response(picture))
+        await asyncio.sleep(0.05)
+        picture.body.assert_not_awaited()            # waiting; nothing copied yet
+        self.assertFalse(taking.done())
+        release.set()
+        await asyncio.gather(reading, taking)
+        saved = self.db.images_for("222", "446")[0]
+        self.assertEqual(Path(saved["file"]).read_bytes(), b"preview bytes")
+        self.assertEqual(self.ses._filing, 0)
+
+    async def test_picture_nobody_mentions_is_dropped_at_once(self):
+        picture = self.picture_response()
+        started = time.monotonic()
+        await self.ses._on_response(picture)
+        self.assertLess(time.monotonic() - started, 0.5)
+        picture.body.assert_not_awaited()
+
+    async def test_waiting_picture_is_dropped_when_the_list_does_not_mention_it(self):
+        listing, release = self.slow_listing([message("900")])
+        reading = asyncio.create_task(self.ses._on_response(listing))
+        await asyncio.sleep(0.01)
+        picture = self.picture_response()
+        taking = asyncio.create_task(self.ses._on_response(picture))
+        await asyncio.sleep(0.02)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(reading, taking), timeout=5)
+        picture.body.assert_not_awaited()
+
+    async def test_message_list_that_fails_still_releases_waiting_pictures(self):
+        async def broken_json():
+            await asyncio.sleep(0.02)
+            raise RuntimeError("body lost")
+
+        listing = response("https://discord.com/api/v9/channels/222/messages?limit=50")
+        listing.json = broken_json
+        reading = asyncio.create_task(self.ses._on_response(listing))
+        await asyncio.sleep(0.005)
+        await asyncio.wait_for(self.ses._on_response(self.picture_response()), timeout=5)
+        await reading
+        self.assertEqual(self.ses._filing, 0)
+
+    async def test_waiting_picture_stops_waiting_when_the_job_is_stopped(self):
+        listing, release = self.slow_listing([self.picture_message()])
+        reading = asyncio.create_task(self.ses._on_response(listing))
+        await asyncio.sleep(0.01)
+        picture = self.picture_response()
+        taking = asyncio.create_task(self.ses._on_response(picture))
+        await asyncio.sleep(0.02)
+        self.pacer.stop_event.set()
+        await asyncio.wait_for(taking, timeout=5)
+        picture.body.assert_not_awaited()
+        release.set()
+        await asyncio.wait_for(reading, timeout=5)
+
+    async def test_picture_size_is_known_before_it_is_copied(self):
+        self.image()
+        unknown = self.picture_response()            # no length declared, none measured
+        del unknown.headers["content-length"]
+        await self.ses._take_image(unknown)
+        unknown.body.assert_not_awaited()
+        big = self.picture_response()                # the browser measured it: too big
+        del big.headers["content-length"]
+        big.request.sizes = AsyncMock(return_value={"responseBodySize": sc.MAX_IMAGE_BYTES + 1})
+        await self.ses._take_image(big)
+        big.body.assert_not_awaited()
+        self.assertIsNone(self.db.images_for("222", "446")[0]["file"])
+        packed = self.picture_response()             # measured, but packed on the wire
+        del packed.headers["content-length"]
+        packed.headers["content-encoding"] = "gzip"
+        packed.request.sizes = AsyncMock(return_value={"responseBodySize": 13})
+        await self.ses._take_image(packed)
+        packed.body.assert_not_awaited()
+        fine = self.picture_response()               # measured and small enough
+        del fine.headers["content-length"]
+        fine.request.sizes = AsyncMock(return_value={"responseBodySize": 13})
+        await self.ses._take_image(fine)
+        fine.body.assert_awaited_once()
+        self.assertIsNotNone(self.db.images_for("222", "446")[0]["file"])
+
+    async def test_only_a_few_browser_pictures_are_copied_at_once(self):
+        self.image()
+        inside = peak = 0
+        release = asyncio.Event()
+
+        async def body():
+            nonlocal inside, peak
+            inside += 1
+            peak = max(peak, inside)
+            await release.wait()
+            inside -= 1
+            return b"preview bytes"
+
+        tasks = []
+        for _ in range(12):
+            r = self.picture_response()
+            r.body = body
+            tasks.append(asyncio.create_task(self.ses._take_image(r)))
+        await asyncio.sleep(0.05)
+        self.assertEqual(peak, sc.IMAGE_READS_AT_ONCE)
+        release.set()
+        await asyncio.gather(*tasks)
+        self.assertEqual(peak, sc.IMAGE_READS_AT_ONCE)
+        self.assertIsNotNone(self.db.images_for("222", "446")[0]["file"])
 
     def test_filename_traversal_and_invalid_channel_cannot_escape_images(self):
         row = self.image(name="../../escape.png")

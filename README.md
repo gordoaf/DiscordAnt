@@ -115,6 +115,10 @@ through, so the default is "everything since last time". Only jobs that
 finished count, and the channel that is furthest behind decides, so a failed
 or waiting job never moves the date. A batch that was last run by version
 1.0.0 offers the day it was last queued until its first run here finishes.
+Queued is not the same as collected, so the app checks that day against the
+archive and says in the log which channels have nothing collected just before
+it. That is normal for a quiet channel; if a run was missed, set an earlier
+end date (only what is missing is collected).
 If the end date is blank the app
 asks first, because that means every channel back to its beginning. Tick
 **Batches into a dated subfolder** and each run gets its own folder.
@@ -129,8 +133,9 @@ Everything one person posted in a server over the dates above.
   of that server.
 
 You get a `.json` file with their messages grouped by channel, each with the
-messages around it and the message it was replying to, and a `.md`
-transcript of the same thing that reads like the conversation.
+messages around it and a short quote of what it was replying to, and a `.md`
+transcript of the same thing that reads like the conversation. The replied-to
+message appears in full only when it is among the messages around it.
 
 The app types the name into Discord's own search box, pages through the
 results, then opens each conversation to read what was said around it. Only
@@ -205,7 +210,9 @@ The conversation around a message counts as loaded when eight messages on
 each side are held, or fewer where the channel begins or ends there. A
 message that has been deleted since it was found is not asked for again.
 **Start over** reloads full messages and conversation context, including
-edits; an interrupted refresh resumes later.
+edits. It is recorded in the archive the moment the job begins, so a job that
+is stopped at any point, even before its first search answers, still finishes
+the refresh when it is run again.
 
 ### Updating an older archive
 
@@ -218,7 +225,10 @@ is run again may revisit a few messages once.
 
 Version 1.0.1 set the record of what had been read aside when it updated an
 archive. If yours went through 1.0.1, this version puts that record back the
-first time it opens the archive.
+first time it opens the archive. One exception cannot be detected: if you
+pressed **Start over** on a channel job in 1.0.1 and stopped it before it
+finished, 1.0.1 kept no note of that, so the rest of that range counts as
+read again. Press **Start over** on that job once more to redo it.
 
 ### Output files
 
@@ -231,7 +241,8 @@ that is done or failed no longer holds its file. Only one Windows app
 instance can run at a time.
 
 Pictures the browser shows while it scrolls are saved from the browser's own
-copy, so they cost Discord nothing extra. The optional full-size pass at the
+copy, so they cost Discord nothing extra. A picture is only copied once its
+size is known to be within 20 MiB, and a few at a time. The optional full-size pass at the
 end of a job fetches each picture once more at full size, over a separate
 HTTPS connection to Discord's picture servers with no login, cookies,
 redirects or web-page rendering; it is limited to 20 MiB per picture and
@@ -348,7 +359,7 @@ and the bundled-browser self-test, then publishes the installer, `SHA256SUMS`
 and `provenance.json`. Compare the installer's hash before running it:
 
 ```
-Get-FileHash .\DiscordAnt-Setup-1.0.2.exe -Algorithm SHA256
+Get-FileHash .\DiscordAnt-Setup-1.0.3.exe -Algorithm SHA256
 ```
 
 Provenance records the source commit, dependency lock hashes, Python version,

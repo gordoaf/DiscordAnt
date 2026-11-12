@@ -379,6 +379,15 @@ class Store:
                 "SELECT lo, hi FROM coverage WHERE channel_id=? AND lo<=? AND hi>=?",
                 (channel_id, mid, mid)).fetchone()
 
+    def covered_below(self, channel_id, message_id):
+        """Where the newest covered stretch that ends before message_id ends,
+        or None when nothing older is covered."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT MAX(hi) FROM coverage WHERE channel_id=? AND hi<?",
+                (channel_id, int(message_id))).fetchone()
+        return row[0] if row else None
+
     def gaps(self, channel_id, lo, hi):
         """Stretches of [lo, hi] NOT yet covered, newest first."""
         lo, hi = int(lo), int(hi)

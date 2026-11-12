@@ -57,6 +57,8 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_SESSION_IMAGE_BYTES = 100 * 1024 * 1024
 IMAGE_DOWNLOAD_TIMEOUT_S = 20
 IMAGE_CHUNK_BYTES = 64 * 1024
+IMAGE_READS_AT_ONCE = 4                 # browser-loaded pictures copied at one time
+IMAGE_INDEX_WAIT_S = 30                 # how long a picture waits for its message list
 CLEANUP_TIMEOUT_S = 5
 
 # Pacing — deliberately human-slow. Do not "optimize" these down.
@@ -745,6 +747,9 @@ class Session:
         self._response_tasks = set()
         self._request_starts = weakref.WeakKeyDictionary()
         self._download_lock = asyncio.Lock()
+        self._image_reads = asyncio.Semaphore(IMAGE_READS_AT_ONCE)
+        self._filing = 0                    # message lists being read right now
+        self._filed = asyncio.Event()       # set whenever one of them is done
         self._image_bytes = 0
         self._image_failures = 0
         self._image_limit_reported = False
@@ -843,22 +848,36 @@ class Session:
             m = MSG_PATH_RE.fullmatch(parsed.path) if parsed else None
             if m:
                 if resp.status == 200 and resp.request.method == "GET":
-                    data = await self.pacer.run(resp.json(), timeout=30)
-                    if isinstance(data, list):
-                        self._take_batch(m.group(1), url, data, request_started=request_started)
+                    # Counted as "being filed" from here until its messages
+                    # are in the archive: a picture that finishes loading in
+                    # between waits for this instead of finding nothing.
+                    self._filing += 1
+                    try:
+                        data = await self.pacer.run(resp.json(), timeout=30)
+                        if isinstance(data, list):
+                            self._take_batch(m.group(1), url, data,
+                                             request_started=request_started)
+                    finally:
+                        self._filing -= 1
+                        self._filed.set()
                 return
             m = SEARCH_PATH_RE.fullmatch(parsed.path) if parsed else None
             if m:
                 if resp.request.method != "GET":
                     return
+                self._filing += 1
                 try:
-                    data = await self.pacer.run(resp.json(), timeout=30)
-                except PacerInterrupted:
-                    return
-                except Exception:
-                    data = None
-                self._take_search(m.group(1), url, resp.status, data,
-                                  request_started=request_started)
+                    try:
+                        data = await self.pacer.run(resp.json(), timeout=30)
+                    except PacerInterrupted:
+                        return
+                    except Exception:
+                        data = None
+                    self._take_search(m.group(1), url, resp.status, data,
+                                      request_started=request_started)
+                finally:
+                    self._filing -= 1
+                    self._filed.set()
                 return
             if self.images_dir is not None and resp.status == 200:
                 if _image_url(url):
@@ -987,33 +1006,79 @@ class Session:
         if ctype not in IMAGE_EXT or parsed is None:
             return
         path = parsed.path
-        m = ATTACH_PATH_RE.match(path)
-        if m:
-            rows = self.store.images_by_attachment(m.group(2))
-        elif path.startswith("/external/"):
-            rows = self.store.images_by_match(path)
-        else:
+        if not (ATTACH_PATH_RE.match(path) or path.startswith("/external/")):
             return
-        rows = [row for row in rows if store_mod.image_identity(row.get("url")) ==
-                store_mod.image_identity(resp.url) and (not row["full"]
-                or not row.get("file") or not Path(row["file"]).is_file())]
+
+        def lookup():
+            """(is any message known to carry this picture?, rows still wanting it)"""
+            m = ATTACH_PATH_RE.match(path)
+            found = (self.store.images_by_attachment(m.group(2)) if m
+                     else self.store.images_by_match(path))
+            found = [row for row in found if store_mod.image_identity(row.get("url")) ==
+                     store_mod.image_identity(resp.url)]
+            return bool(found), [row for row in found if not row["full"]
+                                 or not row.get("file") or not Path(row["file"]).is_file()]
+
+        known, rows = lookup()
+        # A picture the browser already had (or got quickly) can finish before
+        # the message list that mentions it has been read and filed. Wait for
+        # the lists being read right now, then look again. Nothing is held
+        # meanwhile except this answer's handle.
+        give_up = time.monotonic() + IMAGE_INDEX_WAIT_S
+        while not known and self._filing and not self._closed:
+            left = give_up - time.monotonic()
+            if left <= 0:
+                break
+            self._filed.clear()
+            try:
+                await self.pacer.run(self._filed.wait(), timeout=left)
+            except asyncio.TimeoutError:
+                break
+            known, rows = lookup()
         if not rows:
             return
-        # The per-job download allowance is for pictures this app fetches by
-        # itself (the full-size pass). These bytes the browser already has.
-        declared = resp.headers.get("content-length") or ""
-        if declared.isdecimal() and int(declared) > MAX_IMAGE_BYTES:
+
+        # Size first, bytes second: the limit is checked before the picture is
+        # copied out of the browser, and only a few are copied at a time.
+        # (The per-job download allowance is not charged here: it is for
+        # pictures this app fetches itself; these the browser already has.)
+        size = await self._body_size(resp)
+        if size is None or size > MAX_IMAGE_BYTES:
             return
-        try:
-            body = await self.pacer.run(resp.body(), timeout=30)
-        except PacerInterrupted:
-            raise
-        except Exception:
-            return                      # e.g. served from the browser's cache
+        async with self._image_reads:
+            if self._closed:
+                return
+            _known, rows = lookup()     # another copy may have been saved meanwhile
+            if not rows:
+                return
+            try:
+                body = await self.pacer.run(resp.body(), timeout=30)
+            except PacerInterrupted:
+                raise
+            except Exception:
+                return                  # e.g. the browser no longer has it
         if not body or len(body) > MAX_IMAGE_BYTES or self._closed:
             return
         for row in rows:
             self._save_image(row, body, ctype, full=False)
+
+    async def _body_size(self, resp):
+        """How big a browser-loaded picture is, without copying it: the
+        length the server declared, else what the browser measured on the
+        wire. None = cannot tell, and then it is not copied."""
+        declared = (resp.headers.get("content-length") or "").strip()
+        if declared.isdecimal():
+            return int(declared)
+        if (resp.headers.get("content-encoding") or "identity").strip().lower() != "identity":
+            return None                 # packed on the wire: its real size is unknown
+        try:
+            sizes = await self.pacer.run(resp.request.sizes(), timeout=30)
+            size = int(sizes["responseBodySize"])
+        except PacerInterrupted:
+            raise
+        except Exception:
+            return None
+        return size if size > 0 else None
 
     async def _download_image(self, url):
         """Download in a bounded, isolated transport; never render untrusted data."""

@@ -916,8 +916,10 @@ class ScraperApp:
             self.batch_info.set("no batches yet — 'New...' makes one")
             return
         since, how = self._batch_since(b)
+        unsure = len(self._legacy_gaps(b, since)) if how == "last queued" else 0
         self.batch_info.set(f"{len(b.get('channels', []))} channel(s)" +
-                            (f" · {how} {since}" if since else " · not collected yet"))
+                            (f" · {how} {since}" if since else " · not collected yet") +
+                            (f" · {unsure} may have a gap before it (see log)" if unsure else ""))
 
     def _on_batch_selected(self, _event=None):
         self._prefill_batch_dates()
@@ -938,6 +940,17 @@ class ScraperApp:
             self.out_var.set(out_dir)
         self._log(f"Batch '{b['name']}': {len(b.get('channels', []))} channel(s)"
                   + (f", {how} {since}" if since else ", not collected yet"))
+        gaps = self._legacy_gaps(b, since) if how == "last queued" else []
+        if gaps:
+            shown = ", ".join(f"{label} ({'nothing before' if day is None else 'since ' + day})"
+                              for label, day in gaps[:8])
+            more = f" and {len(gaps) - 8} more" if len(gaps) > 8 else ""
+            self._log(
+                f"NOTE: {since} is the day this batch was last queued, which does not "
+                f"prove every channel was collected up to it. For {len(gaps)} channel(s) "
+                f"the archive holds nothing between an earlier day and {since}: {shown}"
+                f"{more}. A quiet channel looks like this too. If a run was missed, set "
+                "an earlier End date before queueing; only what is missing is collected.")
 
     def _batch_success_date(self, batch):
         """The day every channel of the batch is collected through, or ''.
@@ -961,6 +974,31 @@ class ScraperApp:
         if isinstance(legacy, str) and legacy:
             return legacy, "last queued"
         return "", ""
+
+    def _legacy_gaps(self, batch, day):
+        """Channels whose collected history does not reach `day`, the day an
+        older version last QUEUED the batch.
+
+        Queued is not collected: a job may have failed and been cleared. The
+        archive knows what was read, so each channel is checked against it.
+        Returns [(label, last day held before `day`, or None for nothing)].
+        A channel that was simply quiet shows up here as well, which is why
+        this is reported and the offered date is left alone."""
+        try:
+            point = scraper_core.dt_to_snowflake(
+                datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc))
+        except (TypeError, ValueError):
+            return []
+        out = []
+        for channel in batch.get("channels", []):
+            cid = channel["channel_id"]
+            if self.store.interval_containing(cid, point):
+                continue
+            below = self.store.covered_below(cid, point)
+            label, _auto = self._label_for(channel["guild_id"], cid, channel.get("label"))
+            out.append((label, scraper_core.snowflake_to_dt(below).strftime("%Y-%m-%d")
+                        if below is not None else None))
+        return out
 
     def _edit_batch(self, new=False):
         if new:
