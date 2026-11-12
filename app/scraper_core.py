@@ -313,6 +313,9 @@ def normalize(msg):
         rec["type"] = kind
     if msg.get("edited_timestamp"):
         rec["edited"] = True
+        # Kept so the archive can tell an older state of a message from a
+        # newer one (see store.older_revision): Discord stamps every edit.
+        rec["edited_ts"] = msg["edited_timestamp"]
 
     mref = msg.get("message_reference") or {}
     if mref.get("message_id"):
@@ -748,6 +751,7 @@ class Session:
         self._request_starts = weakref.WeakKeyDictionary()
         self._download_lock = asyncio.Lock()
         self._image_reads = asyncio.Semaphore(IMAGE_READS_AT_ONCE)
+        self.images_unsized = 0             # browser pictures left alone: size unknown
         self._filing = 0                    # message lists being read right now
         self._filed = asyncio.Event()       # set whenever one of them is done
         self._image_bytes = 0
@@ -1043,7 +1047,10 @@ class Session:
         # (The per-job download allowance is not charged here: it is for
         # pictures this app fetches itself; these the browser already has.)
         size = await self._body_size(resp)
-        if size is None or size > MAX_IMAGE_BYTES:
+        if size is None:
+            self.images_unsized += 1    # said once, at the end of the job
+            return
+        if size > MAX_IMAGE_BYTES:
             return
         async with self._image_reads:
             if self._closed:
@@ -1066,11 +1073,12 @@ class Session:
         """How big a browser-loaded picture is, without copying it: the
         length the server declared, else what the browser measured on the
         wire. None = cannot tell, and then it is not copied."""
+        if (resp.headers.get("content-encoding") or "identity").strip().lower() != "identity":
+            return None                 # packed on the wire: no length given or
+                                        # measured there says how big it unpacks
         declared = (resp.headers.get("content-length") or "").strip()
         if declared.isdecimal():
             return int(declared)
-        if (resp.headers.get("content-encoding") or "identity").strip().lower() != "identity":
-            return None                 # packed on the wire: its real size is unknown
         try:
             sizes = await self.pacer.run(resp.request.sizes(), timeout=30)
             size = int(sizes["responseBodySize"])
@@ -1158,6 +1166,15 @@ class Session:
             self.images_saved += 1
         return saved
 
+    def image_note(self):
+        """A line for the log when browser-loaded pictures were left uncopied
+        because their size could not be confirmed first; otherwise None."""
+        if not self.images_unsized:
+            return None
+        return (f"NOTE: {self.images_unsized} picture(s) the browser showed were not "
+                "copied, because their size could not be confirmed first. The "
+                "full-size pass, when it is switched on, fetches them.")
+
     # ---- names
     async def note_names(self, guild_id=None):
         """Read the channel and server names off the page into the archive."""
@@ -1241,7 +1258,12 @@ async def run_scrape(*, guild_id, channel_id, start_dt, end_dt, out_path,
         count = export_channel(store, channel_id, win_lo, win_hi, out_path, log)
         return {"count": count, "new": new, "outcome": outcome, "images": images,
                 "channel_name": store.name(channel_id),
-                "guild_name": store.name(guild_id)}
+                "guild_name": store.name(guild_id),
+                # The UTC day this job's dates really ended on. "Now" is taken
+                # a minute in the past, so just after midnight this is still
+                # the day before - and that is the day a batch may call
+                # collected, or its next top-up would skip that last minute.
+                "through": snowflake_to_dt(win_hi).strftime("%Y-%m-%d")}
 
     gaps = store.gaps(channel_id, win_lo, win_hi)
     if not gaps:
@@ -1390,6 +1412,8 @@ async def run_scrape(*, guild_id, channel_id, start_dt, end_dt, out_path,
                     outcome = pacer.outcome()
             if images:
                 log(f"Images saved this run: {images}")
+            if ses.image_note():
+                log(ses.image_note())
 
     except PacerInterrupted as exc:
         outcome = exc.outcome

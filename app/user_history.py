@@ -849,6 +849,8 @@ async def run_user_history(*, guild_id, channel_id, username, start_dt, end_dt,
                 rows += store.images_for(ch, rec["id"])
             await ses.fetch_full_images(rows)
         images = ses.images_saved
+        if ses.image_note():
+            log(ses.image_note())
         if pacer.outcome() is not None:
             outcome = pacer.outcome()
 

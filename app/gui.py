@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 import tkinter as tk
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -1448,7 +1448,8 @@ class ScraperApp:
         status, note = jobs.outcome_status(job, res)
         job["status"], job["note"] = status, note
         if status == DONE and job.get("batch_id") and job["type"] == CHANNEL_JOB:
-            self._ui(lambda j=dict(job), when=run_started: self._record_batch_success(j, when))
+            self._ui(lambda j=dict(job), when=run_started, day=res.get("through"):
+                     self._record_batch_success(j, when, day))
         totals[status] += 1
         totals["messages"] += res.get("count", 0)
         totals["new"] += res.get("new", 0)
@@ -1461,8 +1462,14 @@ class ScraperApp:
         self._relabel(job)
         self._sync_out(job)
 
-    def _record_batch_success(self, job, started):
+    def _record_batch_success(self, job, started, through=None):
         """A batch job finished: move that channel's "collected through" day.
+
+        `through` is the day the job's dates really ended on, as the engine
+        reports it. The engine stops a minute short of "now", so a job that
+        starts in the first minute after midnight UTC has only collected the
+        day before; calling the new day collected would make the next top-up
+        skip that last minute. Without it, the same day is worked out here.
 
         Each channel keeps one unbroken stretch, from covered_from to
         completed. The first finished job starts it. A later job extends it
@@ -1475,8 +1482,9 @@ class ScraperApp:
         ch = job["channel_id"]
         done = batch.setdefault("completed", {})
         covered = batch.setdefault("covered_from", {})
-        today = started.strftime("%Y-%m-%d")
-        through = min(job["start"] or today, today)
+        limit = through or (started - timedelta(seconds=scraper_core.NOW_MARGIN_S)
+                            ).strftime("%Y-%m-%d")
+        through = min(job["start"] or limit, limit)
         old = done.get(ch, "")
         if not old or ch not in covered:
             done[ch], covered[ch] = through, job["end"]

@@ -185,7 +185,7 @@ class GuiTests(unittest.TestCase):
     def finish_all(self, day):
         for job in list(self.app.jobs):
             job["status"] = jobs.DONE
-            self.app._record_batch_success(dict(job), datetime(2026, 11, day, tzinfo=timezone.utc))
+            self.app._record_batch_success(dict(job), datetime(2026, 11, day, 12, tzinfo=timezone.utc))
         self.app.jobs.clear()
 
     def test_batch_from_an_older_version_still_offers_since_last_time(self):
@@ -233,7 +233,7 @@ class GuiTests(unittest.TestCase):
         batch = {"id": "b1", "name": "b", "channels": [{"guild_id": "11", "channel_id": "22"}],
                  "completed": {"22": "2026-11-05"}, "covered_from": {"22": "2026-11-01"}}
         self.app.batches = [batch]
-        when = datetime(2026, 11, 20, tzinfo=timezone.utc)
+        when = datetime(2026, 11, 20, 12, tzinfo=timezone.utc)
         older = self.job()
         older.update(batch_id="b1", end="2026-01-01", start="2026-03-01")
         self.app._record_batch_success(older, when)
@@ -282,6 +282,26 @@ class GuiTests(unittest.TestCase):
         self.app._prefill_batch_dates()
         self.assertEqual(self.app.end_var.get(), "2026-11-12")
         self.assertFalse(any(line.startswith("NOTE:") for line in self.app.logs))
+
+    def test_job_just_after_midnight_counts_only_the_day_before(self):
+        # The engine stops a minute short of "now". At 00:00:20 UTC that is
+        # still yesterday, and yesterday's last minute is not collected yet.
+        just_after = datetime(2026, 11, 12, 0, 0, 20, tzinfo=timezone.utc)
+        for through in ("2026-11-11", None):          # the engine's answer; worked out here
+            with self.subTest(through=through):
+                batch = {"id": "b1", "name": "b",
+                         "channels": [{"guild_id": "11", "channel_id": "22"}]}
+                self.app.batches = [batch]
+                job = self.job()
+                job.update(batch_id="b1", end="2026-11-09", start="")
+                self.app._record_batch_success(dict(job), just_after, through)
+                self.assertEqual(batch["completed"], {"22": "2026-11-11"})
+                self.assertEqual(self.app._batch_success_date(batch), "2026-11-11")
+        # A minute later the job's dates reach into the new day.
+        batch = {"id": "b1", "name": "b", "channels": [{"guild_id": "11", "channel_id": "22"}]}
+        self.app.batches = [batch]
+        self.app._record_batch_success(dict(job), datetime(2026, 11, 12, 0, 1, 30, tzinfo=timezone.utc))
+        self.assertEqual(batch["completed"], {"22": "2026-11-12"})
 
     def test_finished_job_does_not_hold_its_file(self):
         done, waiting = self.job(status=jobs.DONE), self.job(status=jobs.PENDING)

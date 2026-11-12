@@ -15,6 +15,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -128,6 +129,40 @@ def image_identity(url):
         return str(url or "")
 
 
+def _edit_stamp(text):
+    """Discord's edit time as something that can be compared, or None."""
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def older_revision(new, stored_json):
+    """True when `new` is an EARLIER state of a message than the stored copy,
+    so it must not replace it.
+
+    Two answers that hold the same message can be read out of order (the
+    older one's body arrives last), and an edit can fall between them. Discord
+    stamps every edit: a copy without a stamp predates any copy with one, and
+    of two stamped copies the earlier stamp is the older text. Copies stored
+    by versions that kept only an "edited" flag have no stamp; they lose to
+    any stamped copy, and beat only a copy that was never edited at all.
+    Anything that cannot be compared is treated as not older (it replaces)."""
+    try:
+        old = json.loads(stored_json)
+    except ValueError:
+        return False
+    if not isinstance(old, dict):
+        return False
+    old_raw, new_raw = old.get("edited_ts"), new.get("edited_ts")
+    if old_raw:
+        if not new_raw:
+            return True                 # a never-edited copy against an edited one
+        old_ts, new_ts = _edit_stamp(old_raw), _edit_stamp(new_raw)
+        return old_ts is not None and new_ts is not None and new_ts < old_ts
+    return bool(old.get("edited")) and not new_raw and not new.get("edited")
+
+
 class Store:
     def __init__(self, path):
         self.path = Path(path)
@@ -176,6 +211,8 @@ class Store:
                     self.db.execute("ALTER TABLE images ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
                 if "identity" not in columns:
                     self.db.execute("ALTER TABLE images ADD COLUMN identity TEXT")
+                self.db.execute(
+                    "CREATE INDEX IF NOT EXISTS images_identity ON images(identity)")
 
                 proof = self._meta("proof_version")
                 if proof != "3":
@@ -270,6 +307,8 @@ class Store:
                         continue
                     if had and rec.get("imported"):
                         continue        # never downgrade to an imported copy
+                    if had and older_revision(rec, had[0]):
+                        continue        # a stale answer must not undo a newer edit
                     self.db.execute(
                         "INSERT OR REPLACE INTO messages(channel_id,id,ts,author_id,rec) "
                         "VALUES(?,?,?,?,?)",
@@ -699,6 +738,22 @@ class Store:
             "full=CASE WHEN images.identity IS excluded.identity THEN images.full ELSE 0 END, "
             "generation=excluded.generation, identity=excluded.identity",
             (key, channel_id, mid, kind, name, match, url, w, h, identity, generation))
+        # The same picture may already be saved for another message (a link
+        # posted twice, a forwarded attachment). The browser loads it once, so
+        # no second answer will come for this reference: point it at the copy
+        # that exists. Nothing is requested, and each reference can still be
+        # upgraded on its own later.
+        if identity and self.db.execute(
+                "SELECT file FROM images WHERE key=?", (key,)).fetchone()[0] is None:
+            donors = self.db.execute(
+                "SELECT file,bytes,full FROM images WHERE identity=? AND kind=? AND key<>? "
+                "AND file IS NOT NULL ORDER BY full DESC, bytes DESC LIMIT 5",
+                (identity, kind, key)).fetchall()
+            for file, nbytes, full in donors:
+                if Path(file).is_file():
+                    self.db.execute("UPDATE images SET file=?,bytes=?,full=? WHERE key=?",
+                                    (file, nbytes, full, key))
+                    break
 
     def _image_rows(self, where, args):
         with self.lock:

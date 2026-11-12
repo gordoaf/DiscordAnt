@@ -5,6 +5,7 @@ import threading
 import time
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -428,6 +429,10 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         packed.request.sizes = AsyncMock(return_value={"responseBodySize": 13})
         await self.ses._take_image(packed)
         packed.body.assert_not_awaited()
+        declared = self.picture_response()           # length declared, but packed
+        declared.headers["content-encoding"] = "gzip"
+        await self.ses._take_image(declared)
+        declared.body.assert_not_awaited()
         fine = self.picture_response()               # measured and small enough
         del fine.headers["content-length"]
         fine.request.sizes = AsyncMock(return_value={"responseBodySize": 13})
@@ -459,6 +464,44 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks)
         self.assertEqual(peak, sc.IMAGE_READS_AT_ONCE)
         self.assertIsNotNone(self.db.images_for("222", "446")[0]["file"])
+
+    async def test_late_older_answer_does_not_undo_a_newer_edit(self):
+        # Two answers hold message 444. The older one's body arrives last.
+        stale, release = self.slow_listing([dict(message("444"), content="before the edit")])
+        reading = asyncio.create_task(self.ses._on_response(stale))
+        await asyncio.sleep(0.01)
+        newer = response("https://discord.com/api/v9/channels/222/messages?limit=50",
+                         [dict(message("444"), content="after the edit",
+                               edited_timestamp="2026-11-11T13:05:00+00:00")])
+        await self.ses._on_response(newer)
+        self.assertEqual(self.db.get("222", "444")["content"], "after the edit")
+        release.set()
+        await reading
+        kept = self.db.get("222", "444")
+        self.assertEqual(kept["content"], "after the edit")
+        self.assertEqual(kept["edited_ts"], "2026-11-11T13:05:00+00:00")
+        self.assertEqual(len(self.ses.fetches), 2)       # both answers still count as read
+
+    async def test_job_reports_the_day_its_dates_really_ended_on(self):
+        # 20 seconds after midnight UTC, "now" (a minute back) is still yesterday.
+        cutoff = sc.dt_to_snowflake(datetime(2026, 11, 11, 23, 59, 20, tzinfo=timezone.utc))
+        self.db.add_coverage("222", 0, cutoff)
+        with patch.object(sc, "now_snowflake", return_value=cutoff):
+            result = await sc.run_scrape(
+                guild_id="111", channel_id="222", start_dt=None, end_dt=None,
+                out_path=self.root / "out.json", profile_dir=self.root / "unused",
+                log=lambda _: None, stop_event=threading.Event(), store=self.db)
+        self.assertEqual(result["outcome"], sc.TOP)
+        self.assertEqual(result["through"], "2026-11-11")
+
+    async def test_pictures_left_uncopied_are_counted_and_said_once(self):
+        self.image()
+        self.assertIsNone(self.ses.image_note())
+        unknown = self.picture_response()
+        del unknown.headers["content-length"]
+        await self.ses._take_image(unknown)
+        self.assertEqual(self.ses.images_unsized, 1)
+        self.assertIn("1 picture(s)", self.ses.image_note())
 
     def test_filename_traversal_and_invalid_channel_cannot_escape_images(self):
         row = self.image(name="../../escape.png")

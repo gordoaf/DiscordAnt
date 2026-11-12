@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.4 — 2026-11-12
+
+Three long-standing problems found by a review of 1.0.3. None adds any
+request to Discord.
+
+- An older copy of a message can no longer replace a newer edit. When two of
+  Discord's answers held the same message and the older one arrived last, the
+  archive went back to the text from before the edit. The time of the edit is
+  now kept with each message and compared first.
+- A batch's "collected through" day is the day the job's dates really ended
+  on. The app stops a minute short of "now", so a job started in the first
+  minute after midnight UTC had only collected the day before, yet recorded
+  the new day, and the next top-up skipped that last minute.
+- A picture already saved for one message is listed for every other message
+  that shows the same picture (a link posted twice, a forwarded attachment).
+  The browser loads such a picture once, so the later messages used to be
+  left without it.
+- A declared length is no longer trusted for a picture that is packed on the
+  wire, and the log says how many browser-shown pictures were left uncopied
+  because their size could not be confirmed.
+
 ## 1.0.3 — 2026-11-12
 
 - Start over on a user job is now recorded in the archive the moment the job

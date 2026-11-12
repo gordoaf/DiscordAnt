@@ -178,6 +178,71 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.covered_below("1", 20))
         self.assertIsNone(self.store.covered_below("2", 99))
 
+    def test_older_copy_of_a_message_never_replaces_a_newer_edit(self):
+        posted = dict(rec(100), content="as posted")
+        edit1 = dict(rec(100), content="first edit", edited=True,
+                     edited_ts="2026-11-11T10:00:00+00:00")
+        edit2 = dict(rec(100), content="second edit", edited=True,
+                     edited_ts="2026-11-11T10:05:00.500000+00:00")
+        self.store.put_messages("1", [edit2])
+        for stale in (posted, edit1):
+            self.assertEqual(self.store.put_messages("1", [stale]), [])
+            self.assertEqual(self.store.get("1", 100)["content"], "second edit")
+        # The same revision again (new reactions and the like) does replace...
+        self.store.put_messages("1", [dict(edit2, reactions=[["x", 2]])])
+        self.assertEqual(self.store.get("1", 100)["reactions"], [["x", 2]])
+        # ...and so does a later edit, whatever way Discord writes the time.
+        self.store.put_messages("1", [dict(edit2, content="third edit",
+                                           edited_ts="2026-11-11T11:00:00Z")])
+        self.assertEqual(self.store.get("1", 100)["content"], "third edit")
+
+    def test_copy_stored_by_an_older_version_gives_way_only_to_a_real_newer_one(self):
+        legacy = dict(rec(100), content="edited, stored by 1.0.x", edited=True)   # flag, no time
+        self.store.put_messages("1", [legacy])
+        self.store.put_messages("1", [dict(rec(100), content="never edited")])
+        self.assertEqual(self.store.get("1", 100)["content"], "edited, stored by 1.0.x")
+        stamped = dict(rec(100), content="read again", edited=True,
+                       edited_ts="2026-11-11T10:00:00+00:00")
+        self.store.put_messages("1", [stamped])
+        self.assertEqual(self.store.get("1", 100)["content"], "read again")
+        # A time that cannot be read proves nothing, so that copy is taken.
+        self.store.put_messages("1", [dict(stamped, content="odd time", edited_ts="???")])
+        self.assertEqual(self.store.get("1", 100)["content"], "odd time")
+        # A never-edited message is refreshed as before.
+        self.store.put_messages("1", [dict(rec(200), content="one")])
+        self.store.put_messages("1", [dict(rec(200), content="two")])
+        self.assertEqual(self.store.get("1", 200)["content"], "two")
+
+    def test_new_reference_to_a_picture_already_saved_reuses_that_copy(self):
+        link = "https://images-ext-1.discordapp.net/external/SIG/https/example.com/pic.png"
+        self.store.put_messages("1", [embed(link, mid=100)])
+        saved = self.root / "pic.png"
+        self.assertTrue(self.store.save_image_file(
+            self.store.images_for("1", 100)[0], saved, b"picture", True))
+        # the same link posted again: the browser will not load it a second time
+        self.store.put_messages("1", [embed(link + "?ex=later&hm=sig", mid=200)])
+        again = self.store.images_for("1", 200)[0]
+        self.assertEqual((again["file"], again["bytes"], again["full"]), (str(saved), 7, 1))
+        # a different picture gets nothing
+        self.store.put_messages("1", [embed(link.replace("pic.png", "other.png"), mid=300)])
+        self.assertIsNone(self.store.images_for("1", 300)[0]["file"])
+        # an attachment forwarded into another channel
+        self.store.put_messages("1", [attachment(400)])
+        kept = self.root / "attachment.png"
+        self.assertTrue(self.store.save_image_file(
+            self.store.images_for("1", 400)[0], kept, b"preview", False))
+        self.store.put_messages("2", [attachment(500)])
+        forwarded = self.store.images_for("2", 500)[0]
+        self.assertEqual((forwarded["file"], forwarded["full"]), (str(kept), 0))
+        # the reused preview can still be bettered for that message alone
+        better = self.root / "attachment-full.png"
+        self.assertTrue(self.store.save_image_file(forwarded, better, b"full size", True))
+        self.assertEqual(self.store.images_for("1", 400)[0]["file"], str(kept))
+        # a copy that has gone from disk is not handed on
+        saved.unlink()
+        self.store.put_messages("1", [embed(link, mid=600)])
+        self.assertIsNone(self.store.images_for("1", 600)[0]["file"])
+
     def test_message_transaction_rollback(self):
         with self.assertRaises(ValueError):
             self.store.put_messages("1", [attachment(), rec("bad")])

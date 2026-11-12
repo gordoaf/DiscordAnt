@@ -111,8 +111,9 @@ makes one: give it a name and paste the channel links. After that, pick the
 batch and press **Queue batch** to get one job per channel.
 
 Picking a batch fills in the end date with the day the batch is collected
-through, so the default is "everything since last time". Only jobs that
-finished count, and the channel that is furthest behind decides, so a failed
+through, so the default is "everything since last time". That day is the one
+the job's dates really ended on (a job started seconds after midnight UTC has
+only collected the day before). Only jobs that finished count, and the channel that is furthest behind decides, so a failed
 or waiting job never moves the date. A batch that was last run by version
 1.0.0 offers the day it was last queued until its first run here finishes.
 Queued is not the same as collected, so the app checks that day against the
@@ -189,6 +190,9 @@ the part of its dates the archive does not hold yet.
 - Asking for dates you already have opens no browser at all. The file is
   simply written from the archive.
 - Overlapping dates cost only the part that is new.
+- A message that is read again replaces the stored copy, except when the copy
+  that arrives is an older state of it: an edit already in the archive is
+  never undone by an answer that was sent before the edit but arrived late.
 
 User jobs verify that Discord's search is newest first and that each result
 page belongs to the requested person, server and date range. If the app
@@ -241,7 +245,9 @@ that is done or failed no longer holds its file. Only one Windows app
 instance can run at a time.
 
 Pictures the browser shows while it scrolls are saved from the browser's own
-copy, so they cost Discord nothing extra. A picture is only copied once its
+copy, so they cost Discord nothing extra. When the same picture belongs to
+more than one message (a link posted twice, a forwarded attachment), the copy
+already saved is listed for each of them. A picture is only copied once its
 size is known to be within 20 MiB, and a few at a time. The optional full-size pass at the
 end of a job fetches each picture once more at full size, over a separate
 HTTPS connection to Discord's picture servers with no login, cookies,
@@ -359,7 +365,7 @@ and the bundled-browser self-test, then publishes the installer, `SHA256SUMS`
 and `provenance.json`. Compare the installer's hash before running it:
 
 ```
-Get-FileHash .\DiscordAnt-Setup-1.0.3.exe -Algorithm SHA256
+Get-FileHash .\DiscordAnt-Setup-1.0.4.exe -Algorithm SHA256
 ```
 
 Provenance records the source commit, dependency lock hashes, Python version,
